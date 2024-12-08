@@ -1,13 +1,22 @@
 #[allow(unused_imports)]
 use std::io::{self, Write};
 
+use codecrafters_shell::command::Command;
+
 fn main() {
     // Uncomment this block to pass the first stage
-    print!("$ ");
-    io::stdout().flush().unwrap();
+    let stdin = io::stdin();
 
     // Wait for user input
-    let stdin = io::stdin();
     let mut input = String::new();
-    stdin.read_line(&mut input).unwrap();
+    loop {
+        print!("$ ");
+        io::stdout().flush().unwrap();
+        stdin.read_line(&mut input).unwrap();
+        match Command::read(&input[..input.len()-1]) {
+            Ok(_) => todo!(),
+            Err(err) => eprintln!("{err}"),
+        }
+        input.clear();
+    }
 }

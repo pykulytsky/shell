@@ -4,6 +4,7 @@ use thiserror::Error;
 
 pub enum Command {
     Exit { status_code: i32 },
+    Echo { msg: String },
 }
 
 #[derive(Debug, Error)]
@@ -22,6 +23,10 @@ impl Command {
             Ok(Exit {
                 status_code: rest.parse::<i32>()?,
             })
+        } else if let Some(rest) = input.strip_prefix("echo ") {
+            Ok(Echo {
+                msg: rest.to_string(),
+            })
         } else {
             Err(CommandError::InvalidCommand(input.to_string()))
         }
@@ -30,6 +35,7 @@ impl Command {
     pub fn run(self) {
         match self {
             Command::Exit { status_code } => exit(status_code),
+            Command::Echo { msg } => println!("{msg}")
         }
     }
 }

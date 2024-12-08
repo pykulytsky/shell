@@ -1,4 +1,3 @@
-use std::process::exit;
 
 use thiserror::Error;
 
@@ -34,17 +33,6 @@ impl Command {
             })
         } else {
             Err(CommandError::InvalidCommand(input.to_string()))
-        }
-    }
-
-    pub fn run(self) {
-        match self {
-            Command::Exit { status_code } => exit(status_code),
-            Command::Echo { msg } => println!("{msg}"),
-            Command::Type { command } => match command.as_ref() {
-                c if matches!(c, "exit" | "echo" | "type") => println!("{c} is a shell builtin"),
-                c => eprintln!("{c}: not found"),
-            },
         }
     }
 }

@@ -1,10 +1,13 @@
+use std::ffi::OsString;
 
+use crate::Shell;
 use thiserror::Error;
 
 pub enum Command {
     Exit { status_code: i32 },
     Echo { msg: String },
     Type { command: String },
+    Program { name: OsString, input: String },
 }
 
 #[derive(Debug, Error)]
@@ -17,7 +20,7 @@ pub enum CommandError {
 }
 
 impl Command {
-    pub fn read(input: &str) -> Result<Self, CommandError> {
+    pub fn read(input: &str, shell: &Shell) -> Result<Self, CommandError> {
         use Command::*;
         if let Some(rest) = input.strip_prefix("exit ") {
             Ok(Exit {
@@ -30,6 +33,19 @@ impl Command {
         } else if let Some(rest) = input.strip_prefix("type ") {
             Ok(Type {
                 command: rest.to_string(),
+            })
+        } else if let Some(program) = input
+            .split_once(" ")
+            .and_then(|(left, _)| shell.get_path_executable(left))
+        {
+            Ok(Program {
+                name: program.path().into_os_string(),
+                input: input.split_once(" ").unwrap().1.to_string(),
+            })
+        } else if let Some(program) = shell.get_path_executable(input) {
+            Ok(Program {
+                name: program.path().into_os_string(),
+                input: "".to_string(),
             })
         } else {
             Err(CommandError::InvalidCommand(input.to_string()))

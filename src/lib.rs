@@ -1,6 +1,7 @@
 use std::process::exit;
 use std::{fs::DirEntry, os::unix::fs::PermissionsExt};
 pub mod command;
+use std::process::Command as SysCommand;
 
 use command::Command;
 use std::{
@@ -45,12 +46,18 @@ impl Shell {
             print!("$ ");
             io::stdout().flush().unwrap();
             stdin.read_line(&mut input).unwrap();
-            match Command::read(&input[..input.len() - 1]) {
+            match Command::read(&input[..input.len() - 1], self) {
                 Ok(command) => self.run(command),
                 Err(err) => eprintln!("{err}"),
             }
             input.clear();
         }
+    }
+
+    fn get_path_executable(&self, name: &str) -> Option<&DirEntry> {
+        self.path_executables
+            .iter()
+            .find(|e| e.path().components().last().unwrap().as_os_str() == name)
     }
 
     pub fn run(&self, command: Command) {
@@ -59,20 +66,22 @@ impl Shell {
             Command::Echo { msg } => println!("{msg}"),
             Command::Type { command } => match command.as_ref() {
                 c if matches!(c, "exit" | "echo" | "type") => println!("{c} is a shell builtin"),
-                c if self
-                    .path_executables
-                    .iter()
-                    .any(|e| e.path().components().last().unwrap().as_os_str() == c) =>
-                {
-                    let entry = self
-                        .path_executables
-                        .iter()
-                        .find(|e| e.path().components().last().unwrap().as_os_str() == c)
-                        .unwrap();
+                c if self.get_path_executable(c).is_some() => {
+                    let entry = self.get_path_executable(c).unwrap();
                     println!("{c} is {}", entry.path().as_path().to_string_lossy());
                 }
                 c => eprintln!("{c}: not found"),
             },
+            Command::Program { name, input } => {
+                let mut stdout = io::stdout();
+                let mut stderr = io::stderr();
+                let output = SysCommand::new(name)
+                    .args(input.split(" "))
+                    .output()
+                    .unwrap();
+                stdout.write_all(&output.stdout).unwrap();
+                stderr.write_all(&output.stderr).unwrap();
+            }
         }
     }
 }

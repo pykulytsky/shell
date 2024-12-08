@@ -42,7 +42,7 @@ impl Command {
             Command::Exit { status_code } => exit(status_code),
             Command::Echo { msg } => println!("{msg}"),
             Command::Type { command } => match command.as_ref() {
-                "exit" | "echo" | "type" => println!("exit is a shell builtin"),
+                c if matches!(c, "exit" | "echo" | "type") => println!("{c} is a shell builtin"),
                 c => eprintln!("{c}: not found"),
             },
         }

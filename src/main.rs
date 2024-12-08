@@ -13,8 +13,8 @@ fn main() {
         print!("$ ");
         io::stdout().flush().unwrap();
         stdin.read_line(&mut input).unwrap();
-        match Command::read(&input[..input.len()-1]) {
-            Ok(_) => todo!(),
+        match Command::read(&input[..input.len() - 1]) {
+            Ok(command) => command.run(),
             Err(err) => eprintln!("{err}"),
         }
         input.clear();

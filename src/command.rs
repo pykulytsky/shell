@@ -47,6 +47,8 @@ impl Command {
                 name: program.path().into_os_string(),
                 input: "".to_string(),
             })
+        } else if let Some((left, _)) = input.split_once(" ") {
+            Err(CommandError::InvalidCommand(left.to_string()))
         } else {
             Err(CommandError::InvalidCommand(input.to_string()))
         }

@@ -40,7 +40,6 @@ impl Shell {
     pub fn start(&mut self) {
         let stdin = io::stdin();
 
-        // Wait for user input
         let mut input = String::new();
         loop {
             print!("$ ");
@@ -75,7 +74,8 @@ impl Shell {
             Command::Program { name, input } => {
                 let mut stdout = io::stdout();
                 let mut stderr = io::stderr();
-                let output = SysCommand::new(name)
+                let canonicalized_name = self.canonicalize_path(name.to_str().unwrap()).unwrap();
+                let output = SysCommand::new(canonicalized_name)
                     .args(input.split(" "))
                     .output()
                     .unwrap();
@@ -83,5 +83,14 @@ impl Shell {
                 stderr.write_all(&output.stderr).unwrap();
             }
         }
+    }
+
+    pub fn canonicalize_path<P: AsRef<str> + ?Sized>(&self, path: &P) -> Option<String> {
+        for p in self.path.split(":") {
+            if path.as_ref().contains(p) {
+                return Some(path.as_ref().replace(p, "").replace("/", ""));
+            }
+        }
+        Some(path.as_ref().to_string())
     }
 }

@@ -1,6 +1,7 @@
 use std::process::exit;
 use std::{fs::DirEntry, os::unix::fs::PermissionsExt};
 pub mod command;
+mod utils;
 use std::process::Command as SysCommand;
 
 use command::Command;
@@ -8,6 +9,8 @@ use std::{
     fs::read_dir,
     io::{self, Write},
 };
+
+use crate::utils::trim_whitespace;
 
 #[derive(Debug, Default)]
 pub struct Shell {
@@ -45,7 +48,7 @@ impl Shell {
             print!("$ ");
             io::stdout().flush().unwrap();
             stdin.read_line(&mut input).unwrap();
-            match Command::read(&input[..input.len() - 1], self) {
+            match Command::read(input[..input.len() - 1].trim_start(), self) {
                 Ok(command) => self.run(command),
                 Err(err) => eprintln!("{err}"),
             }
@@ -62,7 +65,12 @@ impl Shell {
     pub fn run(&self, command: Command) {
         match command {
             Command::Exit { status_code } => exit(status_code),
-            Command::Echo { msg } => println!("{msg}"),
+            Command::Echo { msg } => {
+                println!(
+                    "{}",
+                    trim_whitespace(&msg)
+                )
+            }
             Command::Type { command } => match command.as_ref() {
                 c if matches!(c, "exit" | "echo" | "type" | "pwd") => {
                     println!("{c} is a shell builtin")
@@ -82,7 +90,7 @@ impl Shell {
                 let mut stderr = io::stderr();
                 let canonicalized_name = self.canonicalize_path(name.to_str().unwrap()).unwrap();
                 let output = SysCommand::new(canonicalized_name)
-                    .args(input.split(" "))
+                    .args(input.split_whitespace().map(|arg| arg.trim_matches('\'')))
                     .output()
                     .unwrap();
                 stdout.write_all(&output.stdout).unwrap();

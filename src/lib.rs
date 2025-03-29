@@ -66,10 +66,7 @@ impl Shell {
         match command {
             Command::Exit { status_code } => exit(status_code),
             Command::Echo { msg } => {
-                println!(
-                    "{}",
-                    trim_whitespace(&msg)
-                )
+                println!("{}", trim_whitespace(&msg).trim_matches('\''))
             }
             Command::Type { command } => match command.as_ref() {
                 c if matches!(c, "exit" | "echo" | "type" | "pwd") => {

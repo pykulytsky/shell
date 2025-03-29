@@ -88,6 +88,11 @@ impl Shell {
                 stdout.write_all(&output.stdout).unwrap();
                 stderr.write_all(&output.stderr).unwrap();
             }
+            Command::Cd { path } => {
+                let _ = std::env::set_current_dir(&path).map_err(|_e| {
+                    eprintln!("cd: {path}: No such file or directory");
+                });
+            }
         }
     }
 

@@ -8,6 +8,7 @@ pub enum Command {
     Echo { msg: String },
     Type { command: String },
     Pwd,
+    Cd { path: String },
     Program { name: OsString, input: String },
 }
 
@@ -37,6 +38,11 @@ impl Command {
             })
         } else if input == "pwd" {
             Ok(Pwd)
+
+        } else if let Some(rest) = input.strip_prefix("cd ") {
+            Ok(Cd {
+                path: rest.to_string(),
+            })
         } else if let Some(program) = input
             .split_once(" ")
             .and_then(|(left, _)| shell.get_path_executable(left))

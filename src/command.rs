@@ -7,6 +7,7 @@ pub enum Command {
     Exit { status_code: i32 },
     Echo { msg: String },
     Type { command: String },
+    Pwd,
     Program { name: OsString, input: String },
 }
 
@@ -34,6 +35,8 @@ impl Command {
             Ok(Type {
                 command: rest.to_string(),
             })
+        } else if input == "pwd" {
+            Ok(Pwd)
         } else if let Some(program) = input
             .split_once(" ")
             .and_then(|(left, _)| shell.get_path_executable(left))

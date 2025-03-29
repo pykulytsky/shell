@@ -64,13 +64,19 @@ impl Shell {
             Command::Exit { status_code } => exit(status_code),
             Command::Echo { msg } => println!("{msg}"),
             Command::Type { command } => match command.as_ref() {
-                c if matches!(c, "exit" | "echo" | "type") => println!("{c} is a shell builtin"),
+                c if matches!(c, "exit" | "echo" | "type" | "pwd") => {
+                    println!("{c} is a shell builtin")
+                }
                 c if self.get_path_executable(c).is_some() => {
                     let entry = self.get_path_executable(c).unwrap();
                     println!("{c} is {}", entry.path().as_path().to_string_lossy());
                 }
                 c => eprintln!("{c}: not found"),
             },
+            Command::Pwd => {
+                let pwd = std::env::current_dir().unwrap();
+                println!("{}", pwd.display());
+            }
             Command::Program { name, input } => {
                 let mut stdout = io::stdout();
                 let mut stderr = io::stderr();

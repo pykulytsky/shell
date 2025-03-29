@@ -89,7 +89,14 @@ impl Shell {
                 stderr.write_all(&output.stderr).unwrap();
             }
             Command::Cd { path } => {
-                let _ = std::env::set_current_dir(&path).map_err(|_e| {
+                let home = std::env::var("HOME").unwrap();
+                let mut cd_path = path.clone();
+
+                if path == "~" {
+                    cd_path = home;
+                }
+
+                let _ = std::env::set_current_dir(&cd_path).map_err(|_e| {
                     eprintln!("cd: {path}: No such file or directory");
                 });
             }

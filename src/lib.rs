@@ -10,7 +10,6 @@ use std::{
     io::{self, Write},
 };
 use utils::DOUBLE_QUOTES_ESCAPE;
-// use utils::trim_whitespace;
 
 #[derive(Debug, Default)]
 pub struct Shell {
@@ -48,9 +47,11 @@ impl Shell {
             print!("$ ");
             io::stdout().flush().unwrap();
             stdin.read_line(&mut input).unwrap();
-            match Command::read(input[..input.len() - 1].trim_start(), self) {
-                Ok(command) => self.run(command),
-                Err(err) => eprintln!("{err}"),
+            if input != "\n" {
+                match Command::read(input[..input.len() - 1].trim_start(), self) {
+                    Ok(command) => self.run(command),
+                    Err(err) => eprintln!("{err}"),
+                }
             }
             input.clear();
         }

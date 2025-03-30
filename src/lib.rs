@@ -134,6 +134,9 @@ impl Shell {
                         current_arg.clear();
                     }
                 }
+                '\\' if !in_double_quotes && !in_single_quotes => {
+                    current_arg.push(chars.next().unwrap());
+                }
                 _ => current_arg.push(c),
             }
         }

@@ -131,9 +131,11 @@ impl Shell {
                 '"' if !in_single_quotes => {
                     in_double_quotes = !in_double_quotes;
                 }
-                '\\' if in_double_quotes || !in_single_quotes => {
+                '\\' if in_double_quotes || (!in_single_quotes && !in_double_quotes) => {
                     if let Some(next_c) = chars.next() {
-                        if !in_double_quotes && DOUBLE_QUOTES_ESCAPE.contains(&next_c) {
+                        if !in_double_quotes
+                            || (in_double_quotes && DOUBLE_QUOTES_ESCAPE.contains(&next_c))
+                        {
                             current_arg.push(next_c);
                         } else {
                             current_arg.push(c);

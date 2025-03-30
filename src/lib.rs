@@ -9,8 +9,7 @@ use std::{
     fs::read_dir,
     io::{self, Write},
 };
-
-use crate::utils::trim_whitespace;
+// use utils::trim_whitespace;
 
 #[derive(Debug, Default)]
 pub struct Shell {
@@ -66,7 +65,7 @@ impl Shell {
         match command {
             Command::Exit { status_code } => exit(status_code),
             Command::Echo { msg } => {
-                println!("{}", trim_whitespace(&msg).trim_matches('\''))
+                println!("{}", Self::parse_args(&msg).join(" "))
             }
             Command::Type { command } => match command.as_ref() {
                 c if matches!(c, "exit" | "echo" | "type" | "pwd") => {
@@ -86,8 +85,9 @@ impl Shell {
                 let mut stdout = io::stdout();
                 let mut stderr = io::stderr();
                 let canonicalized_name = self.canonicalize_path(name.to_str().unwrap()).unwrap();
+                let args = Self::parse_args(&input);
                 let output = SysCommand::new(canonicalized_name)
-                    .args(input.split_whitespace().map(|arg| arg.trim_matches('\'')))
+                    .args(args)
                     .output()
                     .unwrap();
                 stdout.write_all(&output.stdout).unwrap();
@@ -115,5 +115,31 @@ impl Shell {
             }
         }
         Some(path.as_ref().to_string())
+    }
+
+    pub fn parse_args(args: &str) -> Vec<String> {
+        let mut parsed_args = Vec::new();
+        let mut current_arg = String::new();
+        let mut in_quotes = false;
+
+        let mut chars = args.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '\'' => in_quotes = !in_quotes,
+                ' ' if !in_quotes => {
+                    if !current_arg.is_empty() {
+                        parsed_args.push(current_arg.clone());
+                        current_arg.clear();
+                    }
+                }
+                _ => current_arg.push(c),
+            }
+        }
+
+        if !current_arg.is_empty() {
+            parsed_args.push(current_arg);
+        }
+
+        parsed_args
     }
 }

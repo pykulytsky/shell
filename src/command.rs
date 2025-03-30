@@ -1,16 +1,18 @@
 use std::{
     ffi::OsString,
-    fs::File,
+    fs::{File, OpenOptions},
     io::{stderr, stdout, Write},
 };
 
 use crate::{utils::REDIRECTS, Shell};
 use thiserror::Error;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum Sink {
     Stdout,
-    Strerr,
+    Stderr,
+    StdoutAppend,
+    StderrAppend,
 }
 
 #[derive(Debug)]
@@ -47,7 +49,9 @@ impl Command {
         let redirect_to = redirect_pos.map(|pos| args[pos + 1].clone());
         let sink = redirect_pos.map(|pos| match args[pos].as_str() {
             ">" | "1>" => Sink::Stdout,
-            "2>" => Sink::Strerr,
+            ">>" | "1>>" => Sink::StdoutAppend,
+            "2>" => Sink::Stderr,
+            "2>>" => Sink::StderrAppend,
             _ => todo!(),
         });
 
@@ -86,15 +90,15 @@ impl Command {
         };
 
         match (redirect_to, sink) {
-            (Some(to), Some(Sink::Stdout)) => Ok(Command {
+            (Some(to), Some(Sink::Stdout | Sink::StdoutAppend)) => Ok(Command {
                 kind: kind?,
-                out: Box::new(File::create(to).unwrap()),
+                out: Box::new(open_redirect_file(to, sink.unwrap() == Sink::StdoutAppend)),
                 err: Box::new(stderr()),
             }),
-            (Some(to), Some(Sink::Strerr)) => Ok(Command {
+            (Some(to), Some(Sink::Stderr | Sink::StderrAppend)) => Ok(Command {
                 kind: kind?,
                 out: Box::new(stdout()),
-                err: Box::new(File::create(to).unwrap()),
+                err: Box::new(open_redirect_file(to, sink.unwrap() == Sink::StderrAppend)),
             }),
             _ => Ok(Command {
                 kind: kind?,
@@ -103,4 +107,15 @@ impl Command {
             }),
         }
     }
+}
+
+fn open_redirect_file(to: String, append: bool) -> File {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .append(append)
+        .truncate(!append)
+        .open(to)
+        .unwrap()
 }

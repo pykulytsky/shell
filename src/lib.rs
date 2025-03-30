@@ -9,6 +9,7 @@ use std::{
     fs::read_dir,
     io::{self, Write},
 };
+use utils::DOUBLE_QUOTES_ESCAPE;
 // use utils::trim_whitespace;
 
 #[derive(Debug, Default)]
@@ -127,15 +128,24 @@ impl Shell {
         while let Some(c) = chars.next() {
             match c {
                 '\'' if !in_double_quotes => in_single_quotes = !in_single_quotes,
-                '"' if !in_single_quotes => in_double_quotes = !in_double_quotes,
+                '"' if !in_single_quotes => {
+                    in_double_quotes = !in_double_quotes;
+                }
+                '\\' if in_double_quotes || !in_single_quotes => {
+                    if let Some(next_c) = chars.next() {
+                        if !in_double_quotes && DOUBLE_QUOTES_ESCAPE.contains(&next_c) {
+                            current_arg.push(next_c);
+                        } else {
+                            current_arg.push(c);
+                            current_arg.push(next_c);
+                        }
+                    }
+                }
                 ' ' if !in_single_quotes && !in_double_quotes => {
                     if !current_arg.is_empty() {
                         parsed_args.push(current_arg.clone());
                         current_arg.clear();
                     }
-                }
-                '\\' if !in_double_quotes && !in_single_quotes => {
-                    current_arg.push(chars.next().unwrap());
                 }
                 _ => current_arg.push(c),
             }

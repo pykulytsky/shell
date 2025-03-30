@@ -5,11 +5,11 @@ use thiserror::Error;
 
 pub enum Command {
     Exit { status_code: i32 },
-    Echo { msg: String },
+    Echo { msg: Vec<String> },
     Type { command: String },
     Pwd,
     Cd { path: String },
-    Program { name: OsString, input: String },
+    Program { name: OsString, input: Vec<String> },
 }
 
 #[derive(Debug, Error)]
@@ -24,42 +24,30 @@ pub enum CommandError {
 impl Command {
     pub fn read(input: &str, shell: &Shell) -> Result<Self, CommandError> {
         use Command::*;
-        if let Some(rest) = input.strip_prefix("exit ") {
-            Ok(Exit {
-                status_code: rest.parse::<i32>()?,
-            })
-        } else if let Some(rest) = input.strip_prefix("echo ") {
-            Ok(Echo {
-                msg: rest.to_string(),
-            })
-        } else if let Some(rest) = input.strip_prefix("type ") {
-            Ok(Type {
-                command: rest.to_string(),
-            })
-        } else if input == "pwd" {
-            Ok(Pwd)
-
-        } else if let Some(rest) = input.strip_prefix("cd ") {
-            Ok(Cd {
-                path: rest.to_string(),
-            })
-        } else if let Some(program) = input
-            .split_once(" ")
-            .and_then(|(left, _)| shell.get_path_executable(left))
-        {
-            Ok(Program {
-                name: program.path().into_os_string(),
-                input: input.split_once(" ").unwrap().1.to_string(),
-            })
-        } else if let Some(program) = shell.get_path_executable(input) {
-            Ok(Program {
-                name: program.path().into_os_string(),
-                input: "".to_string(),
-            })
-        } else if let Some((left, _)) = input.split_once(" ") {
-            Err(CommandError::InvalidCommand(left.to_string()))
-        } else {
-            Err(CommandError::InvalidCommand(input.to_string()))
+        let args = Shell::parse_args(input);
+        match args[0].as_str() {
+            "exit" => Ok(Exit {
+                status_code: args[1].parse::<i32>()?,
+            }),
+            "echo" => Ok(Echo {
+                msg: args[1..].to_owned(),
+            }),
+            "type" => Ok(Type {
+                command: args[1].to_string(),
+            }),
+            "pwd" => Ok(Pwd),
+            "cd" => Ok(Cd {
+                path: args[1].to_string(),
+            }),
+            arg if shell.get_path_executable(arg).is_some() => Ok(Program {
+                name: shell
+                    .get_path_executable(arg)
+                    .unwrap()
+                    .path()
+                    .into_os_string(),
+                input: args[1..].to_owned(),
+            }),
+            arg => Err(CommandError::InvalidCommand(arg.to_string())),
         }
     }
 }

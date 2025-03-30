@@ -66,7 +66,7 @@ impl Shell {
         match command {
             Command::Exit { status_code } => exit(status_code),
             Command::Echo { msg } => {
-                println!("{}", Self::parse_args(&msg).join(" "))
+                println!("{}", msg.join(" "))
             }
             Command::Type { command } => match command.as_ref() {
                 c if matches!(c, "exit" | "echo" | "type" | "pwd") => {
@@ -86,9 +86,8 @@ impl Shell {
                 let mut stdout = io::stdout();
                 let mut stderr = io::stderr();
                 let canonicalized_name = self.canonicalize_path(name.to_str().unwrap()).unwrap();
-                let args = Self::parse_args(&input);
                 let output = SysCommand::new(canonicalized_name)
-                    .args(args)
+                    .args(input)
                     .output()
                     .unwrap();
                 stdout.write_all(&output.stdout).unwrap();

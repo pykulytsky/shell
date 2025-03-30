@@ -2,6 +2,8 @@
 
 pub const DOUBLE_QUOTES_ESCAPE: &[char] = &['$', '\\', '"'];
 
+pub const REDIRECTS: &[&str] = &[">", "1>", "2>"];
+
 pub fn trim_whitespace(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
     s.split_whitespace().for_each(|w| {

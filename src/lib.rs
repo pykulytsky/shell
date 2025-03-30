@@ -4,7 +4,7 @@ pub mod command;
 mod utils;
 use std::process::Command as SysCommand;
 
-use command::Command;
+use command::{Command, CommandKind};
 use std::{
     fs::read_dir,
     io::{self, Write},
@@ -62,38 +62,42 @@ impl Shell {
             .find(|e| e.path().components().last().unwrap().as_os_str() == name)
     }
 
-    pub fn run(&self, command: Command) {
-        match command {
-            Command::Exit { status_code } => exit(status_code),
-            Command::Echo { msg } => {
-                println!("{}", msg.join(" "))
+    pub fn run(&self, mut command: Command) {
+        match command.kind {
+            CommandKind::Exit { status_code } => exit(status_code),
+            CommandKind::Echo { msg } => {
+                let _ = writeln!(command.out, "{}", msg.join(" "));
             }
-            Command::Type { command } => match command.as_ref() {
+            CommandKind::Type { arg } => match arg.as_ref() {
                 c if matches!(c, "exit" | "echo" | "type" | "pwd") => {
-                    println!("{c} is a shell builtin")
+                    let _ = writeln!(command.out, "{c} is a shell builtin");
                 }
                 c if self.get_path_executable(c).is_some() => {
                     let entry = self.get_path_executable(c).unwrap();
-                    println!("{c} is {}", entry.path().as_path().to_string_lossy());
+                    let _ = writeln!(
+                        command.out,
+                        "{c} is {}",
+                        entry.path().as_path().to_string_lossy()
+                    );
                 }
-                c => eprintln!("{c}: not found"),
+                c => {
+                    let _ = writeln!(command.err, "{c}: not found");
+                }
             },
-            Command::Pwd => {
+            CommandKind::Pwd => {
                 let pwd = std::env::current_dir().unwrap();
-                println!("{}", pwd.display());
+                let _ = writeln!(command.out, "{}", pwd.display());
             }
-            Command::Program { name, input } => {
-                let mut stdout = io::stdout();
-                let mut stderr = io::stderr();
+            CommandKind::Program { name, input } => {
                 let canonicalized_name = self.canonicalize_path(name.to_str().unwrap()).unwrap();
                 let output = SysCommand::new(canonicalized_name)
                     .args(input)
                     .output()
                     .unwrap();
-                stdout.write_all(&output.stdout).unwrap();
-                stderr.write_all(&output.stderr).unwrap();
+                command.out.write_all(&output.stdout).unwrap();
+                command.err.write_all(&output.stderr).unwrap();
             }
-            Command::Cd { path } => {
+            CommandKind::Cd { path } => {
                 let home = std::env::var("HOME").unwrap();
                 let mut cd_path = path.clone();
 
@@ -102,7 +106,7 @@ impl Shell {
                 }
 
                 let _ = std::env::set_current_dir(&cd_path).map_err(|_e| {
-                    eprintln!("cd: {path}: No such file or directory");
+                    let _ = writeln!(command.err, "cd: {path}: No such file or directory");
                 });
             }
         }

@@ -1,15 +1,32 @@
-use std::ffi::OsString;
+use std::{
+    ffi::OsString,
+    fs::File,
+    io::{stderr, stdout, Write},
+};
 
-use crate::Shell;
+use crate::{utils::REDIRECTS, Shell};
 use thiserror::Error;
 
-pub enum Command {
+#[derive(Debug)]
+pub enum Sink {
+    Stdout,
+    Strerr,
+}
+
+#[derive(Debug)]
+pub enum CommandKind {
     Exit { status_code: i32 },
     Echo { msg: Vec<String> },
-    Type { command: String },
+    Type { arg: String },
     Pwd,
     Cd { path: String },
     Program { name: OsString, input: Vec<String> },
+}
+
+pub struct Command {
+    pub kind: CommandKind,
+    pub out: Box<dyn Write>,
+    pub err: Box<dyn Write>,
 }
 
 #[derive(Debug, Error)]
@@ -22,10 +39,28 @@ pub enum CommandError {
 }
 
 impl Command {
-    pub fn read(input: &str, shell: &Shell) -> Result<Self, CommandError> {
-        use Command::*;
-        let args = Shell::parse_args(input);
-        match args[0].as_str() {
+    pub fn read(input: &str, shell: &Shell) -> Result<Command, CommandError> {
+        use CommandKind::*;
+        let mut args = Shell::parse_args(input);
+
+        let redirect_pos = args.iter().position(|a| REDIRECTS.contains(&a.as_str()));
+        let redirect_to = redirect_pos.map(|pos| args[pos + 1].clone());
+        let sink = redirect_pos.map(|pos| match args[pos].as_str() {
+            ">" | "1>" => Sink::Stdout,
+            "2>" => Sink::Strerr,
+            _ => todo!(),
+        });
+
+        // redirect can not be last argument
+        if let Some(redirect_pos) = redirect_pos {
+            if redirect_pos == args.len() - 1 || redirect_pos < args.len() - 2 {
+                return Err(CommandError::InvalidCommand("Can not redirect".to_string()));
+            }
+            args.pop(); // remove destination
+            args.pop(); // remove sink
+        }
+
+        let kind = match args[0].as_str() {
             "exit" => Ok(Exit {
                 status_code: args[1].parse::<i32>()?,
             }),
@@ -33,7 +68,7 @@ impl Command {
                 msg: args[1..].to_owned(),
             }),
             "type" => Ok(Type {
-                command: args[1].to_string(),
+                arg: args[1].to_string(),
             }),
             "pwd" => Ok(Pwd),
             "cd" => Ok(Cd {
@@ -48,6 +83,24 @@ impl Command {
                 input: args[1..].to_owned(),
             }),
             arg => Err(CommandError::InvalidCommand(arg.to_string())),
+        };
+
+        match (redirect_to, sink) {
+            (Some(to), Some(Sink::Stdout)) => Ok(Command {
+                kind: kind?,
+                out: Box::new(File::create(to).unwrap()),
+                err: Box::new(stderr()),
+            }),
+            (Some(to), Some(Sink::Strerr)) => Ok(Command {
+                kind: kind?,
+                out: Box::new(stdout()),
+                err: Box::new(File::create(to).unwrap()),
+            }),
+            _ => Ok(Command {
+                kind: kind?,
+                out: Box::new(stdout()),
+                err: Box::new(stderr()),
+            }),
         }
     }
 }

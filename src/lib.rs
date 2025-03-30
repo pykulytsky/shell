@@ -120,13 +120,15 @@ impl Shell {
     pub fn parse_args(args: &str) -> Vec<String> {
         let mut parsed_args = Vec::new();
         let mut current_arg = String::new();
-        let mut in_quotes = false;
+        let mut in_single_quotes = false;
+        let mut in_double_quotes = false;
 
         let mut chars = args.chars().peekable();
         while let Some(c) = chars.next() {
             match c {
-                '\'' => in_quotes = !in_quotes,
-                ' ' if !in_quotes => {
+                '\'' if !in_double_quotes => in_single_quotes = !in_single_quotes,
+                '"' if !in_single_quotes => in_double_quotes = !in_double_quotes,
+                ' ' if !in_single_quotes && !in_double_quotes => {
                     if !current_arg.is_empty() {
                         parsed_args.push(current_arg.clone());
                         current_arg.clear();

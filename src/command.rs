@@ -1,7 +1,7 @@
-use std::{
-    ffi::OsString,
+use std::ffi::OsString;
+use tokio::{
     fs::{File, OpenOptions},
-    io::{stderr, stdout, Write},
+    io::{stderr, stdout, AsyncWrite},
 };
 
 use crate::{utils::REDIRECTS, Shell};
@@ -27,8 +27,8 @@ pub enum CommandKind {
 
 pub struct Command {
     pub kind: CommandKind,
-    pub out: Box<dyn Write>,
-    pub err: Box<dyn Write>,
+    pub out: Box<dyn AsyncWrite + Unpin>,
+    pub err: Box<dyn AsyncWrite + Unpin>,
 }
 
 #[derive(Debug, Error)]
@@ -41,7 +41,7 @@ pub enum CommandError {
 }
 
 impl Command {
-    pub fn read(input: &str, shell: &Shell) -> Result<Command, CommandError> {
+    pub async fn read(input: &str, shell: &Shell) -> Result<Command, CommandError> {
         use CommandKind::*;
         let mut args = Shell::parse_args(input);
 
@@ -92,13 +92,13 @@ impl Command {
         match (redirect_to, sink) {
             (Some(to), Some(Sink::Stdout | Sink::StdoutAppend)) => Ok(Command {
                 kind: kind?,
-                out: Box::new(open_redirect_file(to, sink.unwrap() == Sink::StdoutAppend)),
+                out: Box::new(open_redirect_file(to, sink.unwrap() == Sink::StdoutAppend).await),
                 err: Box::new(stderr()),
             }),
             (Some(to), Some(Sink::Stderr | Sink::StderrAppend)) => Ok(Command {
                 kind: kind?,
                 out: Box::new(stdout()),
-                err: Box::new(open_redirect_file(to, sink.unwrap() == Sink::StderrAppend)),
+                err: Box::new(open_redirect_file(to, sink.unwrap() == Sink::StderrAppend).await),
             }),
             _ => Ok(Command {
                 kind: kind?,
@@ -109,7 +109,7 @@ impl Command {
     }
 }
 
-fn open_redirect_file(to: String, append: bool) -> File {
+async fn open_redirect_file(to: String, append: bool) -> File {
     OpenOptions::new()
         .read(true)
         .write(true)
@@ -117,5 +117,6 @@ fn open_redirect_file(to: String, append: bool) -> File {
         .append(append)
         .truncate(!append)
         .open(to)
+        .await
         .unwrap()
 }

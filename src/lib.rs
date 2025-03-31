@@ -1,13 +1,19 @@
+use std::os::unix::fs::PermissionsExt;
 use std::process::exit;
-use std::{fs::DirEntry, os::unix::fs::PermissionsExt};
+use tokio::fs::DirEntry;
+use tokio::io::AsyncBufReadExt;
+use tokio::io::BufReader;
+use tokio::select;
+use tokio::task;
 pub mod command;
 mod utils;
-use std::process::Command as SysCommand;
+use tokio::process::Command as SysCommand;
 
 use command::{Command, CommandKind};
-use std::{
+use tokio::{
     fs::read_dir,
-    io::{self, Write},
+    io::{self, AsyncWriteExt},
+    signal,
 };
 use utils::DOUBLE_QUOTES_ESCAPE;
 
@@ -18,39 +24,65 @@ pub struct Shell {
 }
 
 impl Shell {
-    pub fn new() -> Self {
-        let path = std::env::var("PATH").unwrap_or("".to_string());
-        let path_executables: Vec<DirEntry> = path
-            .split(":")
-            .flat_map(read_dir)
-            .flatten()
-            .flatten()
-            .filter(|f| {
-                let Ok(metadata) = f.metadata() else {
-                    return false;
-                };
-                (metadata.is_file() || metadata.is_symlink())
-                    && metadata.permissions().mode() & 0o111 != 0
-            })
-            .collect();
+    pub async fn new() -> Self {
+        let path = std::env::var("PATH").unwrap_or_else(|_| "".to_string());
+
+        let mut path_executables = Vec::new();
+        let mut handles = Vec::new();
+
+        for dir in path.split(':') {
+            let dir = dir.to_string();
+            let handle = task::spawn(async move {
+                let mut entries = Vec::new();
+                if let Ok(mut rd) = read_dir(dir).await {
+                    while let Ok(Some(entry)) = rd.next_entry().await {
+                        if let Ok(metadata) = entry.metadata().await {
+                            if (metadata.is_file() || metadata.is_symlink())
+                                && metadata.permissions().mode() & 0o111 != 0
+                            {
+                                entries.push(entry);
+                            }
+                        }
+                    }
+                }
+                entries
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            if let Ok(mut entries) = handle.await {
+                path_executables.append(&mut entries);
+            }
+        }
+
         Self {
             path,
             path_executables,
         }
     }
 
-    pub fn start(&mut self) {
-        let stdin = io::stdin();
+    pub async fn start(&mut self) {
+        let mut stdin = BufReader::new(io::stdin());
+        let mut stdout = io::stdout();
 
         let mut input = String::new();
+
         loop {
-            print!("$ ");
-            io::stdout().flush().unwrap();
-            stdin.read_line(&mut input).unwrap();
-            if input != "\n" {
-                match Command::read(input[..input.len() - 1].trim_start(), self) {
-                    Ok(command) => self.run(command),
-                    Err(err) => eprintln!("{err}"),
+            stdout.write_all("$ ".as_bytes()).await.unwrap();
+            stdout.flush().await.unwrap();
+            select! {
+            _ = stdin.read_line(&mut input) => {
+                    if input != "\n" {
+                        match Command::read(input[..input.len() - 1].trim_start(), self).await {
+                            Ok(command) => self.run(command).await,
+                            Err(err) => eprintln!("{err}"),
+                        }
+                    }
+                },
+            _ = signal::ctrl_c() => {
+                    stdout.write_all(b"\n").await.unwrap();
+                    stdout.flush().await.unwrap();
                 }
             }
             input.clear();
@@ -63,40 +95,60 @@ impl Shell {
             .find(|e| e.path().components().last().unwrap().as_os_str() == name)
     }
 
-    pub fn run(&self, mut command: Command) {
+    pub async fn run(&self, mut command: Command) {
         match command.kind {
             CommandKind::Exit { status_code } => exit(status_code),
             CommandKind::Echo { msg } => {
-                let _ = writeln!(command.out, "{}", msg.join(" "));
+                command
+                    .out
+                    .write_all(format!("{}\n", msg.join(" ")).as_bytes())
+                    .await
+                    .unwrap();
             }
             CommandKind::Type { arg } => match arg.as_ref() {
                 c if matches!(c, "exit" | "echo" | "type" | "pwd") => {
-                    let _ = writeln!(command.out, "{c} is a shell builtin");
+                    command
+                        .out
+                        .write_all(format!("{c} is a shell builtin").as_bytes())
+                        .await
+                        .unwrap();
                 }
                 c if self.get_path_executable(c).is_some() => {
                     let entry = self.get_path_executable(c).unwrap();
-                    let _ = writeln!(
-                        command.out,
-                        "{c} is {}",
-                        entry.path().as_path().to_string_lossy()
-                    );
+                    command
+                        .out
+                        .write_all(
+                            format!("{c} is {}", entry.path().as_path().to_string_lossy())
+                                .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
                 }
                 c => {
-                    let _ = writeln!(command.err, "{c}: not found");
+                    command
+                        .err
+                        .write_all(format!("{c}: not found").as_bytes())
+                        .await
+                        .unwrap();
                 }
             },
             CommandKind::Pwd => {
                 let pwd = std::env::current_dir().unwrap();
-                let _ = writeln!(command.out, "{}", pwd.display());
+                command
+                    .out
+                    .write_all(format!("{}", pwd.display()).as_bytes())
+                    .await
+                    .unwrap();
             }
             CommandKind::Program { name, input } => {
                 let canonicalized_name = self.canonicalize_path(name.to_str().unwrap()).unwrap();
                 let output = SysCommand::new(canonicalized_name)
                     .args(input)
                     .output()
+                    .await
                     .unwrap();
-                command.out.write_all(&output.stdout).unwrap();
-                command.err.write_all(&output.stderr).unwrap();
+                command.out.write_all(&output.stdout).await.unwrap();
+                command.err.write_all(&output.stderr).await.unwrap();
             }
             CommandKind::Cd { path } => {
                 let home = std::env::var("HOME").unwrap();
@@ -106,9 +158,13 @@ impl Shell {
                     cd_path = home;
                 }
 
-                let _ = std::env::set_current_dir(&cd_path).map_err(|_e| {
-                    let _ = writeln!(command.err, "cd: {path}: No such file or directory");
-                });
+                if std::env::set_current_dir(&cd_path).is_err() {
+                    command
+                        .err
+                        .write_all(format!("cd: {path}: No such file or directory").as_bytes())
+                        .await
+                        .unwrap();
+                }
             }
         }
     }

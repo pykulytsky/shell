@@ -22,7 +22,8 @@ pub enum CommandKind {
     Type { arg: String },
     Pwd,
     Cd { path: String },
-    Program { name: OsString, input: Vec<String> },
+    ExternalCommand { name: OsString, input: Vec<String> },
+    History,
 }
 
 pub struct Command {
@@ -78,7 +79,8 @@ impl Command {
             "cd" => Ok(Cd {
                 path: args[1].to_string(),
             }),
-            arg if shell.get_path_executable(arg).is_some() => Ok(Program {
+            "history" => Ok(History),
+            arg if shell.get_path_executable(arg).is_some() => Ok(ExternalCommand {
                 name: shell
                     .get_path_executable(arg)
                     .unwrap()

@@ -1,29 +1,25 @@
 #![allow(clippy::nonminimal_bool)]
 
-use crossterm::terminal::disable_raw_mode;
-use crossterm::terminal::enable_raw_mode;
+use command::{Command, CommandKind};
+use crossterm::cursor::MoveLeft;
+use crossterm::execute;
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use std::os::unix::fs::PermissionsExt;
 use std::process::exit;
-use tokio::fs::DirEntry;
-use tokio::io::AsyncReadExt;
-use tokio::select;
-use tokio::task;
-use utils::normalize_output;
-use utils::ARROW_ANCHOR;
-use utils::BACKSPACE;
-use utils::CTRL_C;
-use utils::CTRL_D;
+use tokio::{
+    fs::{read_dir, DirEntry},
+    io::{self, AsyncReadExt, AsyncWriteExt},
+    process::Command as SysCommand,
+    select, signal, task,
+};
+use utils::{
+    normalize_output, ARROW_ANCHOR, BACKSPACE, CTRL_C, CTRL_D, DOUBLE_QUOTES_ESCAPE, DOWN_ARROW,
+    LEFT_ARROW, RIGHT_ARROW, SHOULD_NOT_REDRAW_PROMPT, UP_ARROW,
+};
+
+pub mod autocomplete;
 pub mod command;
 mod utils;
-use tokio::process::Command as SysCommand;
-
-use command::{Command, CommandKind};
-use tokio::{
-    fs::read_dir,
-    io::{self, AsyncWriteExt},
-    signal,
-};
-use utils::DOUBLE_QUOTES_ESCAPE;
 
 #[derive(Debug, Default)]
 pub struct Shell {
@@ -81,9 +77,10 @@ impl Shell {
         let mut input = Vec::new();
         let mut arrow_buffer = [0u8; 2];
         let mut last_pressed = 0;
+        let mut input_cursor = 0;
 
         loop {
-            if input.is_empty() && last_pressed != BACKSPACE {
+            if input.is_empty() && !SHOULD_NOT_REDRAW_PROMPT.contains(&last_pressed) {
                 stdout.write_all(b"$ ").await?;
             }
             stdout.flush().await?;
@@ -106,8 +103,11 @@ impl Shell {
                                     self.history.push(command_str.to_string());
                                 }
                                 input.clear();
+                                input_cursor = 0;
                             },
                             CTRL_C => {
+                                input.clear();
+                                input_cursor = 0;
                                 stdout.write_all(b"\r\n").await?;
                                 stdout.flush().await?;
                             },
@@ -116,24 +116,49 @@ impl Shell {
                                 break;
                             },
                             BACKSPACE => {
-                                if !input.is_empty() {
-                                    input.pop();
-                                    stdout.write_all(b"\x08 \x08").await?;
+                                // TODO: fix bug with deleting first carachter
+                                if input_cursor != 0 {
+                                    input_cursor -= 1;
+                                    input.remove(input_cursor);
+                                    if input_cursor == input.len() {
+                                        stdout.write_all(b"\x08 \x08").await?;
+                                    } else {
+                                        let mut temp_buf = vec![];
+                                        execute!(temp_buf, Clear(ClearType::CurrentLine)).unwrap();
+                                        stdout.write_all(&temp_buf).await?;
+                                        stdout.write_all(b"\r$ ").await?;
+                                        stdout.write_all(&input).await?;
+                                        temp_buf.clear();
+                                        execute!(temp_buf, MoveLeft(1)).unwrap();
+                                        stdout.write_all(&temp_buf).await?;
+                                        stdout.flush().await?;
+                                    }
                                 }
                             },
                             ARROW_ANCHOR => {
                                 if stdin.read_exact(&mut arrow_buffer).await.is_ok() {
-                                    // match arrow_buffer {
-                                        // [91, 65] => stdout.write_all(b"Up Arrow\r\n").await?,
-                                        // [91, 66] => stdout.write_all(b"Down Arrow\r\n").await?,
-                                        // [91, 67] => stdout.write_all(b"Right Arrow\r\n").await?,
-                                        // [91, 68] => stdout.write_all(b"Left Arrow\r\n").await?,
-                                        // _ => {}
-                                    // }
+                                    match arrow_buffer {
+                                        UP_ARROW => {
+                                            // stdout.write_all(&[ARROW_ANCHOR, UP_ARROW[0], UP_ARROW[1]]).await?;
+                                        },
+                                        DOWN_ARROW => {
+                                            // stdout.write_all(&[ARROW_ANCHOR, DOWN_ARROW[0], DOWN_ARROW[1]]).await?;
+                                        },
+                                        RIGHT_ARROW if input_cursor < input.len() => {
+                                                stdout.write_all(&[ARROW_ANCHOR, RIGHT_ARROW[0], RIGHT_ARROW[1]]).await?;
+                                                input_cursor += 1;
+                                        },
+                                        LEFT_ARROW  if input_cursor != 0 => {
+                                            input_cursor -= 1;
+                                            stdout.write_all(&[ARROW_ANCHOR, LEFT_ARROW[0], LEFT_ARROW[1]]).await?;
+                                        },
+                                        _ => {}
+                                    }
                                 }
                             },
                             _ => {
                                 input.push(byte);
+                                input_cursor += 1;
                                 stdout.write_all(&[byte]).await?;
                             }
                         }

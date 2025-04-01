@@ -67,7 +67,10 @@ impl Command {
 
         let kind = match args[0].as_str() {
             "exit" => Ok(Exit {
-                status_code: args[1].parse::<i32>()?,
+                status_code: match args.get(1) {
+                    Some(status_code) => status_code.parse::<i32>()?,
+                    None => 0,
+                },
             }),
             "echo" => Ok(Echo {
                 msg: args[1..].to_owned(),

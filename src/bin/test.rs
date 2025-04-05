@@ -128,9 +128,8 @@ fn main() {
         "vamoses", "gruffly", "showring", "redates", "briards", "serviced", "credenda", "cee",
         "gills", "booths", "shoat", "escheat",
     ];
-    for word in words {
-        trie.insert(word);
-    }
+
+    trie.extend(words);
 
     loop {
         let mut input = String::new();

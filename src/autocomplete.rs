@@ -55,6 +55,12 @@ impl Trie {
         node.is_word = true;
     }
 
+    pub fn extend<W: AsRef<str>>(&mut self, words: impl IntoIterator<Item = W>) {
+        for word in words.into_iter() {
+            self.insert(word);
+        }
+    }
+
     pub fn suggest<W: AsRef<str>>(&self, input: W) -> Vec<String> {
         let mut node = &self.root;
         let mut curr = String::new();

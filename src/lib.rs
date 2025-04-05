@@ -1,20 +1,21 @@
 #![allow(clippy::nonminimal_bool)]
 
+use autocomplete::Trie;
 use command::{Command, CommandKind};
 use crossterm::cursor::MoveLeft;
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use std::os::unix::fs::PermissionsExt;
-use std::process::exit;
+use std::process::{exit, Stdio};
 use tokio::{
     fs::{read_dir, DirEntry},
-    io::{self, AsyncReadExt, AsyncWriteExt},
+    io::{self, AsyncReadExt, AsyncWriteExt, Stdout},
     process::Command as SysCommand,
     select, signal, task,
 };
 use utils::{
-    normalize_output, ARROW_ANCHOR, BACKSPACE, CTRL_C, CTRL_D, DOUBLE_QUOTES_ESCAPE, DOWN_ARROW,
-    LEFT_ARROW, RIGHT_ARROW, SHOULD_NOT_REDRAW_PROMPT, UP_ARROW,
+    normalize_output, ARROW_ANCHOR, BACKSPACE, BUILTINS, CTRL_C, CTRL_D, DOUBLE_QUOTES_ESCAPE,
+    DOWN_ARROW, LEFT_ARROW, RIGHT_ARROW, SHOULD_NOT_REDRAW_PROMPT, UP_ARROW,
 };
 
 pub mod autocomplete;
@@ -26,6 +27,7 @@ pub struct Shell {
     pub path: String,
     pub path_executables: Vec<DirEntry>,
     pub history: Vec<String>,
+    pub dictionary: Trie,
 }
 
 impl Shell {
@@ -61,10 +63,20 @@ impl Shell {
             }
         }
 
+        let mut dictionary = Trie::new();
+        dictionary.extend(BUILTINS);
+
+        for path in &path_executables {
+            if let Some(p) = path.file_name().to_str() {
+                dictionary.insert(p);
+            }
+        }
+
         Self {
             path,
             path_executables,
             history: vec![],
+            dictionary,
         }
     }
 
@@ -78,6 +90,8 @@ impl Shell {
         let mut arrow_buffer = [0u8; 2];
         let mut last_pressed = 0;
         let mut input_cursor = 0;
+        let mut curr_autocomplete_options: Vec<String> = vec![];
+        let mut autocomplete_cursor: isize = 0;
 
         loop {
             if input.is_empty() && !SHOULD_NOT_REDRAW_PROMPT.contains(&last_pressed) {
@@ -116,7 +130,7 @@ impl Shell {
                                 break;
                             },
                             BACKSPACE => {
-                                // TODO: fix bug with deleting first carachter
+                                // TODO: fix bug with deleting first charachter
                                 if input_cursor != 0 {
                                     input_cursor -= 1;
                                     input.remove(input_cursor);
@@ -156,10 +170,15 @@ impl Shell {
                                     }
                                 }
                             },
+                            b'\t' => {
+                                self.handle_autocomplete(&mut input, &mut input_cursor, &mut curr_autocomplete_options, &mut autocomplete_cursor, &mut stdout).await;
+                            }
                             _ => {
                                 input.push(byte);
                                 input_cursor += 1;
                                 stdout.write_all(&[byte]).await?;
+                                autocomplete_cursor = 0;
+                                curr_autocomplete_options.clear();
                             }
                         }
                     }
@@ -222,18 +241,21 @@ impl Shell {
             }
             CommandKind::ExternalCommand { name, input } => {
                 let canonicalized_name = self.canonicalize_path(name.to_str().unwrap()).unwrap();
-                let output = SysCommand::new(canonicalized_name)
+                disable_raw_mode()?;
+                let mut child = SysCommand::new(canonicalized_name)
                     .args(input)
-                    .output()
-                    .await?;
-                command
-                    .out
-                    .write_all(normalize_output(output.stdout).as_ref())
-                    .await?;
-                command
-                    .err
-                    .write_all(normalize_output(output.stderr).as_ref())
-                    .await?;
+                    .stdin(Stdio::inherit())
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .spawn()?;
+
+                let status = child.wait().await?;
+                enable_raw_mode()?;
+
+                // optional: check exit status
+                if !status.success() {
+                    // handle non-zero exit code
+                }
             }
             CommandKind::Cd { path } => {
                 let home = std::env::var("HOME").unwrap();
@@ -310,5 +332,58 @@ impl Shell {
         }
 
         parsed_args
+    }
+
+    async fn handle_autocomplete(
+        &self,
+        input: &mut Vec<u8>,
+        cursor: &mut usize,
+        autocomplete_options: &mut Vec<String>,
+        autocomplete_cursor: &mut isize,
+        stdout: &mut Stdout,
+    ) {
+        let command_str = std::str::from_utf8(input).unwrap();
+
+        if !autocomplete_options.is_empty() {
+            if *autocomplete_cursor < 0 {
+                *autocomplete_cursor = autocomplete_options.len() as isize - 1;
+            }
+            let Some(suffix) = autocomplete_options
+                .get(*autocomplete_cursor as usize)
+                .map(|o| o.to_string())
+            else {
+                return;
+            };
+
+            stdout.write_all(b"\r\x1b[K$ ").await.unwrap();
+            stdout.write_all(suffix.as_bytes()).await.unwrap();
+            stdout.write_u8(b' ').await.unwrap();
+
+            input.clear();
+            input.extend(suffix.as_bytes());
+            input.push(b' ');
+
+            *autocomplete_cursor -= 1;
+            *cursor = suffix.len() + 1;
+            return;
+        }
+
+        let suggestions = self.dictionary.suggest(command_str);
+        if suggestions.is_empty() {
+            return;
+        }
+
+        let suffix = &suggestions[0].clone()[command_str.len()..];
+        stdout.write_all(suffix.as_bytes()).await.unwrap();
+        stdout.write_u8(b' ').await.unwrap();
+
+        for c in suffix.chars() {
+            input.push(c as u8);
+        }
+        input.push(b' ');
+
+        *autocomplete_options = suggestions;
+        *autocomplete_cursor = autocomplete_options.len() as isize - 1;
+        *cursor += suffix.len() + 1;
     }
 }

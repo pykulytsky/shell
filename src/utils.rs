@@ -17,17 +17,3 @@ pub const LEFT_ARROW: [u8; 2] = [91, 68];
 pub const SHOULD_NOT_REDRAW_PROMPT: &[u8] = &[BACKSPACE, ARROW_ANCHOR];
 
 pub const BUILTINS: &[&str] = &["cd", "exit", "echo", "type", "pwd", "history"];
-
-/// Normalizes output from external command, by including `\r` before each `\n`
-pub fn normalize_output(input: Vec<u8>) -> Vec<u8> {
-    input
-        .iter()
-        .flat_map(|&b| {
-            if b == b'\n' {
-                vec![b'\r', b'\n']
-            } else {
-                vec![b]
-            }
-        })
-        .collect::<Vec<_>>()
-}

@@ -1,12 +1,16 @@
 #![allow(clippy::nonminimal_bool)]
 
 use autocomplete::Trie;
-use command::{Command, CommandKind};
+use command::{Command, CommandKind, Sink};
 use crossterm::cursor::MoveLeft;
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
+use std::env::current_dir;
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::os::unix::fs::PermissionsExt;
-use std::process::{exit, Stdio};
+use std::process::{exit, ExitStatus, Stdio};
+use tokio::io::{stderr, stdout, AsyncWrite};
 use tokio::{
     fs::{read_dir, DirEntry},
     io::{self, AsyncReadExt, AsyncWriteExt, Stdout},
@@ -28,44 +32,16 @@ pub struct Shell {
     pub path_executables: Vec<DirEntry>,
     pub history: Vec<String>,
     pub dictionary: Trie,
+    pub last_status: Option<ExitStatus>,
 }
 
 impl Shell {
     pub async fn new() -> Self {
         let path = std::env::var("PATH").unwrap_or_else(|_| "".to_string());
-
-        let mut path_executables = Vec::new();
-        let mut handles = Vec::new();
-
-        for dir in path.split(':') {
-            let dir = dir.to_string();
-            let handle = task::spawn(async move {
-                let mut entries = Vec::new();
-                if let Ok(mut rd) = read_dir(dir).await {
-                    while let Ok(Some(entry)) = rd.next_entry().await {
-                        if let Ok(metadata) = entry.metadata().await {
-                            if (metadata.is_file() || metadata.is_symlink())
-                                && metadata.permissions().mode() & 0o111 != 0
-                            {
-                                entries.push(entry);
-                            }
-                        }
-                    }
-                }
-                entries
-            });
-            handles.push(handle);
-        }
-
-        for handle in handles {
-            if let Ok(mut entries) = handle.await {
-                path_executables.append(&mut entries);
-            }
-        }
+        let path_executables = Self::populate_path_executables(&path).await;
 
         let mut dictionary = Trie::new();
         dictionary.extend(BUILTINS);
-
         for path in &path_executables {
             if let Some(p) = path.file_name().to_str() {
                 dictionary.insert(p);
@@ -77,6 +53,7 @@ impl Shell {
             path_executables,
             history: vec![],
             dictionary,
+            last_status: None,
         }
     }
 
@@ -90,12 +67,13 @@ impl Shell {
         let mut arrow_buffer = [0u8; 2];
         let mut last_pressed = 0;
         let mut input_cursor = 0;
+
         let mut curr_autocomplete_options: Vec<String> = vec![];
         let mut autocomplete_cursor: isize = 0;
 
         loop {
             if input.is_empty() && !SHOULD_NOT_REDRAW_PROMPT.contains(&last_pressed) {
-                stdout.write_all(b"$ ").await?;
+                self.render_prompt(&mut stdout).await?;
             }
             stdout.flush().await?;
 
@@ -138,12 +116,13 @@ impl Shell {
                                         stdout.write_all(b"\x08 \x08").await?;
                                     } else {
                                         let mut temp_buf = vec![];
-                                        execute!(temp_buf, Clear(ClearType::CurrentLine)).unwrap();
+                                        execute!(temp_buf, Clear(ClearType::CurrentLine))?;
                                         stdout.write_all(&temp_buf).await?;
-                                        stdout.write_all(b"\r$ ").await?;
+                                        stdout.write_all(b"\r").await?;
+                                        self.render_prompt(&mut stdout).await?;
                                         stdout.write_all(&input).await?;
                                         temp_buf.clear();
-                                        execute!(temp_buf, MoveLeft(1)).unwrap();
+                                        execute!(temp_buf, MoveLeft(1))?;
                                         stdout.write_all(&temp_buf).await?;
                                         stdout.flush().await?;
                                     }
@@ -153,10 +132,10 @@ impl Shell {
                                 if stdin.read_exact(&mut arrow_buffer).await.is_ok() {
                                     match arrow_buffer {
                                         UP_ARROW => {
-                                            // stdout.write_all(&[ARROW_ANCHOR, UP_ARROW[0], UP_ARROW[1]]).await?;
+                                            self.handle_history_change(-1, &mut stdout).await?;
                                         },
                                         DOWN_ARROW => {
-                                            // stdout.write_all(&[ARROW_ANCHOR, DOWN_ARROW[0], DOWN_ARROW[1]]).await?;
+                                            self.handle_history_change(1, &mut stdout).await?;
                                         },
                                         RIGHT_ARROW if input_cursor < input.len() => {
                                                 stdout.write_all(&[ARROW_ANCHOR, RIGHT_ARROW[0], RIGHT_ARROW[1]]).await?;
@@ -171,7 +150,7 @@ impl Shell {
                                 }
                             },
                             b'\t' => {
-                                self.handle_autocomplete(&mut input, &mut input_cursor, &mut curr_autocomplete_options, &mut autocomplete_cursor, &mut stdout).await;
+                                self.handle_autocomplete(&mut input, &mut input_cursor, &mut curr_autocomplete_options, &mut autocomplete_cursor, &mut stdout).await?;
                             }
                             _ => {
                                 input.push(byte);
@@ -194,68 +173,95 @@ impl Shell {
     }
 
     fn get_path_executable(&self, name: &str) -> Option<&DirEntry> {
-        self.path_executables
-            .iter()
-            .find(|e| e.path().components().last().unwrap().as_os_str() == name)
+        self.path_executables.iter().find(|e| {
+            e.path()
+                .components()
+                .last()
+                .and_then(|p| p.as_os_str().to_str())
+                == Some(name)
+        })
     }
 
-    pub async fn run(&self, mut command: Command) -> io::Result<()> {
+    pub async fn run(&mut self, command: Command) -> io::Result<()> {
+        let mut stdout: Box<dyn AsyncWrite + Unpin> = Box::new(stdout());
+        let mut stderr: Box<dyn AsyncWrite + Unpin> = Box::new(stderr());
+        // let out = match &mut command.stdout_redirect {
+        //     Some(out) => &mut stdout,
+        //     None => &mut stdout,
+        // };
+        let out = &mut stdout;
+        // let err = match &mut command.stderr_redirect {
+        //     Some(err) => todo!(),
+        //     None => &mut stderr,
+        // };
+        let err = &mut stderr;
+
         match command.kind {
             CommandKind::Exit { status_code } => exit(status_code),
             CommandKind::Echo { msg } => {
-                command
-                    .out
-                    .write_all(format!("{}\r\n", msg.join(" ")).as_bytes())
+                out.write_all(format!("{}\r\n", msg.join(" ")).as_bytes())
                     .await?;
             }
             CommandKind::Type { arg } => match arg.as_ref() {
                 c if matches!(c, "exit" | "echo" | "type" | "pwd") => {
-                    command
-                        .out
-                        .write_all(format!("{c} is a shell builtin\r\n").as_bytes())
+                    out.write_all(format!("{c} is a shell builtin\r\n").as_bytes())
                         .await?;
                 }
                 c if self.get_path_executable(c).is_some() => {
-                    let entry = self.get_path_executable(c).unwrap();
-                    command
-                        .out
-                        .write_all(
-                            format!("{c} is {}\r\n", entry.path().as_path().to_string_lossy())
-                                .as_bytes(),
-                        )
-                        .await?;
+                    let entry = self
+                        .get_path_executable(c)
+                        .ok_or(io::Error::other("Can not get path executable "))?;
+                    out.write_all(
+                        format!("{c} is {}\r\n", entry.path().as_path().to_string_lossy())
+                            .as_bytes(),
+                    )
+                    .await?;
                 }
                 c => {
-                    command
-                        .err
-                        .write_all(format!("{c}: not found\r\n").as_bytes())
+                    err.write_all(format!("{c}: not found\r\n").as_bytes())
                         .await?;
                 }
             },
             CommandKind::Pwd => {
                 let pwd = std::env::current_dir()?;
-                command
-                    .out
-                    .write_all(format!("{}\r\n", pwd.display()).as_bytes())
+                out.write_all(format!("{}\r\n", pwd.display()).as_bytes())
                     .await?;
             }
             CommandKind::ExternalCommand { name, input } => {
-                let canonicalized_name = self.canonicalize_path(name.to_str().unwrap()).unwrap();
+                let canonicalized_name = self
+                    .canonicalize_path(
+                        name.to_str()
+                            .ok_or(io::Error::other("Can not convert name to string"))?,
+                    )
+                    .ok_or(io::Error::other("Can not canonicalize path"))?;
                 disable_raw_mode()?;
+                let stdout = command
+                    .stdout_redirect
+                    .and_then(|stdout| {
+                        Self::open_redirect_file(stdout, command.sink == Some(Sink::StdoutAppend))
+                            .ok()
+                    })
+                    .map(Stdio::from)
+                    .unwrap_or(Stdio::inherit());
+                let stderr = command
+                    .stderr_redirect
+                    .and_then(|stderr| {
+                        Self::open_redirect_file(stderr, command.sink == Some(Sink::StderrAppend))
+                            .ok()
+                    })
+                    .map(Stdio::from)
+                    .unwrap_or(Stdio::inherit());
+
                 let mut child = SysCommand::new(canonicalized_name)
                     .args(input)
                     .stdin(Stdio::inherit())
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::inherit())
+                    .stdout(stdout)
+                    .stderr(stderr)
                     .spawn()?;
 
                 let status = child.wait().await?;
                 enable_raw_mode()?;
-
-                // optional: check exit status
-                if !status.success() {
-                    // handle non-zero exit code
-                }
+                self.last_status = Some(status);
             }
             CommandKind::Cd { path } => {
                 let home = std::env::var("HOME").unwrap();
@@ -266,16 +272,12 @@ impl Shell {
                 }
 
                 if std::env::set_current_dir(&cd_path).is_err() {
-                    command
-                        .err
-                        .write_all(format!("cd: {path}: No such file or directory\r\n").as_bytes())
+                    err.write_all(format!("cd: {path}: No such file or directory\r\n").as_bytes())
                         .await?;
                 }
             }
             CommandKind::History => {
-                command
-                    .out
-                    .write_all(format!("{}\r\n", self.history.join("\r\n")).as_bytes())
+                out.write_all(format!("{}\r\n", self.history.join("\r\n")).as_bytes())
                     .await?
             }
         }
@@ -335,14 +337,15 @@ impl Shell {
     }
 
     async fn handle_autocomplete(
-        &self,
+        &mut self,
         input: &mut Vec<u8>,
         cursor: &mut usize,
         autocomplete_options: &mut Vec<String>,
         autocomplete_cursor: &mut isize,
         stdout: &mut Stdout,
-    ) {
-        let command_str = std::str::from_utf8(input).unwrap();
+    ) -> io::Result<()> {
+        let command_str =
+            std::str::from_utf8(input).map_err(|_| io::Error::other("Input is not valid utf-8"))?;
 
         if !autocomplete_options.is_empty() {
             if *autocomplete_cursor < 0 {
@@ -352,12 +355,13 @@ impl Shell {
                 .get(*autocomplete_cursor as usize)
                 .map(|o| o.to_string())
             else {
-                return;
+                return Ok(());
             };
 
-            stdout.write_all(b"\r\x1b[K$ ").await.unwrap();
-            stdout.write_all(suffix.as_bytes()).await.unwrap();
-            stdout.write_u8(b' ').await.unwrap();
+            stdout.write_all(b"\r\x1b[K").await?;
+            self.render_prompt(stdout).await?;
+            stdout.write_all(suffix.as_bytes()).await?;
+            stdout.write_u8(b' ').await?;
 
             input.clear();
             input.extend(suffix.as_bytes());
@@ -365,17 +369,17 @@ impl Shell {
 
             *autocomplete_cursor -= 1;
             *cursor = suffix.len() + 1;
-            return;
+            return Ok(());
         }
 
         let suggestions = self.dictionary.suggest(command_str);
         if suggestions.is_empty() {
-            return;
+            return Ok(());
         }
 
         let suffix = &suggestions[0].clone()[command_str.len()..];
-        stdout.write_all(suffix.as_bytes()).await.unwrap();
-        stdout.write_u8(b' ').await.unwrap();
+        stdout.write_all(suffix.as_bytes()).await?;
+        stdout.write_u8(b' ').await?;
 
         for c in suffix.chars() {
             input.push(c as u8);
@@ -385,5 +389,74 @@ impl Shell {
         *autocomplete_options = suggestions;
         *autocomplete_cursor = autocomplete_options.len() as isize - 1;
         *cursor += suffix.len() + 1;
+
+        Ok(())
+    }
+
+    async fn populate_path_executables(path: &str) -> Vec<DirEntry> {
+        let mut path_executables = Vec::new();
+        let mut handles = Vec::new();
+
+        for dir in path.split(':') {
+            let dir = dir.to_string();
+            let handle = task::spawn(async move {
+                let mut entries = Vec::new();
+                if let Ok(mut rd) = read_dir(dir).await {
+                    while let Ok(Some(entry)) = rd.next_entry().await {
+                        if let Ok(metadata) = entry.metadata().await {
+                            if (metadata.is_file() || metadata.is_symlink())
+                                && metadata.permissions().mode() & 0o111 != 0
+                            {
+                                entries.push(entry);
+                            }
+                        }
+                    }
+                }
+                entries
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            if let Ok(mut entries) = handle.await {
+                path_executables.append(&mut entries);
+            }
+        }
+
+        path_executables
+    }
+
+    async fn render_prompt<S: AsyncWrite + Unpin>(&mut self, sink: &mut S) -> io::Result<()> {
+        let current_dir = current_dir()?;
+        let dir_name = current_dir
+            .file_name()
+            .unwrap_or_else(|| current_dir.as_os_str())
+            .to_string_lossy();
+
+        sink.write_all(dir_name.as_bytes()).await?;
+        sink.write_u8(b' ').await?;
+
+        Ok(())
+    }
+
+    async fn handle_history_change<S: AsyncWrite + Unpin>(
+        &mut self,
+        _to: i8,
+        sink: &mut S,
+    ) -> io::Result<()> {
+        sink.write_all(b"\r\x1b[K").await?;
+        self.render_prompt(sink).await?;
+
+        Ok(())
+    }
+
+    pub fn open_redirect_file(to: String, append: bool) -> std::io::Result<File> {
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .append(append)
+            .truncate(!append)
+            .open(to)
     }
 }

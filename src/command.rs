@@ -1,8 +1,4 @@
 use std::ffi::OsString;
-use tokio::{
-    fs::{File, OpenOptions},
-    io::{stderr, stdout, AsyncWrite},
-};
 
 use crate::{utils::REDIRECTS, Shell};
 use thiserror::Error;
@@ -28,8 +24,9 @@ pub enum CommandKind {
 
 pub struct Command {
     pub kind: CommandKind,
-    pub out: Box<dyn AsyncWrite + Unpin>,
-    pub err: Box<dyn AsyncWrite + Unpin>,
+    pub stdout_redirect: Option<String>,
+    pub stderr_redirect: Option<String>,
+    pub sink: Option<Sink>,
 }
 
 #[derive(Debug, Error)]
@@ -97,31 +94,22 @@ impl Command {
         match (redirect_to, sink) {
             (Some(to), Some(Sink::Stdout | Sink::StdoutAppend)) => Ok(Command {
                 kind: kind?,
-                out: Box::new(open_redirect_file(to, sink.unwrap() == Sink::StdoutAppend).await),
-                err: Box::new(stderr()),
+                stdout_redirect: Some(to),
+                stderr_redirect: None,
+                sink,
             }),
             (Some(to), Some(Sink::Stderr | Sink::StderrAppend)) => Ok(Command {
                 kind: kind?,
-                out: Box::new(stdout()),
-                err: Box::new(open_redirect_file(to, sink.unwrap() == Sink::StderrAppend).await),
+                stdout_redirect: None,
+                stderr_redirect: Some(to),
+                sink,
             }),
             _ => Ok(Command {
                 kind: kind?,
-                out: Box::new(stdout()),
-                err: Box::new(stderr()),
+                stdout_redirect: None,
+                stderr_redirect: None,
+                sink,
             }),
         }
     }
-}
-
-async fn open_redirect_file(to: String, append: bool) -> File {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .append(append)
-        .truncate(!append)
-        .open(to)
-        .await
-        .unwrap()
 }

@@ -101,7 +101,7 @@ impl Shell {
 
         loop {
             if self.prompt.is_empty() && !SHOULD_NOT_REDRAW_PROMPT.contains(&last_pressed) {
-                self.render_prompt(&mut stdout).await?;
+                render_prompt(&mut stdout).await?;
             }
             stdout.flush().await?;
 
@@ -155,7 +155,7 @@ impl Shell {
                                         execute!(temp_buf, Clear(ClearType::CurrentLine))?;
                                         stdout.write_all(&temp_buf).await?;
                                         stdout.write_all(b"\r").await?;
-                                        self.render_prompt(&mut stdout).await?;
+                                        render_prompt(&mut stdout).await?;
                                         stdout.write_all(&self.prompt).await?;
                                         temp_buf.clear();
                                         execute!(temp_buf, MoveLeft((self.prompt.len() - self.prompt_cursor) as u16))?;
@@ -208,7 +208,7 @@ impl Shell {
                                         execute!(temp_buf, Clear(ClearType::CurrentLine))?;
                                         stdout.write_all(&temp_buf).await?;
                                         stdout.write_all(b"\r").await?;
-                                        self.render_prompt(&mut stdout).await?;
+                                        render_prompt(&mut stdout).await?;
                                         stdout.write_all(&self.prompt).await?;
                                         temp_buf.clear();
                                         execute!(temp_buf, MoveLeft((self.prompt.len() - self.prompt_cursor - 1) as u16))?;
@@ -398,7 +398,7 @@ impl Shell {
             };
 
             stdout.write_all(b"\r\x1b[K").await?;
-            self.render_prompt(stdout).await?;
+            render_prompt(stdout).await?;
             stdout.write_all(suffix.as_bytes()).await?;
             stdout.write_u8(b' ').await?;
 
@@ -465,19 +465,6 @@ impl Shell {
         path_executables
     }
 
-    async fn render_prompt<S: AsyncWrite + Unpin>(&mut self, sink: &mut S) -> io::Result<()> {
-        let current_dir = current_dir()?;
-        let dir_name = current_dir
-            .file_name()
-            .unwrap_or_else(|| current_dir.as_os_str())
-            .to_string_lossy();
-
-        sink.write_all(dir_name.as_bytes()).await?;
-        sink.write_u8(b' ').await?;
-
-        Ok(())
-    }
-
     async fn handle_history_change<S: AsyncWrite + Unpin>(
         &mut self,
         to: HistoryDirection,
@@ -513,7 +500,7 @@ impl Shell {
         self.prompt.extend_from_slice(command.as_bytes());
         self.prompt_cursor = self.prompt.len();
         sink.write_all(b"\r\x1b[K").await?;
-        self.render_prompt(sink).await?;
+        render_prompt(sink).await?;
         sink.write_all(command.as_bytes()).await?;
 
         Ok(())
@@ -595,4 +582,17 @@ impl Shell {
         sink.write_all(&temp_buf).await?;
         Ok(())
     }
+}
+
+async fn render_prompt<S: AsyncWrite + Unpin>(sink: &mut S) -> io::Result<()> {
+    let current_dir = current_dir()?;
+    let dir_name = current_dir
+        .file_name()
+        .unwrap_or_else(|| current_dir.as_os_str())
+        .to_string_lossy();
+
+    sink.write_all(dir_name.as_bytes()).await?;
+    sink.write_u8(b' ').await?;
+
+    Ok(())
 }

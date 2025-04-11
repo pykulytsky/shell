@@ -4,6 +4,8 @@ pub const DOUBLE_QUOTES_ESCAPE: &[char] = &['$', '\\', '"'];
 
 pub const REDIRECTS: &[&str] = &[">", "1>", "2>", ">>", "1>>", "2>>"];
 
+pub const PIPE: &str = "|";
+
 pub const CTRL_C: u8 = 3;
 pub const CTRL_D: u8 = 4;
 pub const BACKSPACE: u8 = 127;
@@ -17,3 +19,5 @@ pub const LEFT_ARROW: [u8; 2] = [91, 68];
 pub const SHOULD_NOT_REDRAW_PROMPT: &[u8] = &[BACKSPACE, ARROW_ANCHOR];
 
 pub const BUILTINS: &[&str] = &["cd", "exit", "echo", "type", "pwd", "history"];
+
+pub const HISTORY_FILE: &str = "shell_history";

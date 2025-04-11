@@ -2,13 +2,19 @@
 
 use autocomplete::Trie;
 use command::{Command, CommandKind, Sink};
+use constants::{
+    ARROW_ANCHOR, BACKSPACE, BUILTINS, CTRL_C, CTRL_D, DOUBLE_QUOTES_ESCAPE, DOWN_ARROW,
+    HISTORY_FILE, LEFT_ARROW, RIGHT_ARROW, SHOULD_NOT_REDRAW_PROMPT, UP_ARROW,
+};
 use crossterm::cursor::MoveLeft;
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
+use std::collections::VecDeque;
 use std::env::current_dir;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::{exit, ExitStatus, Stdio};
 use tokio::io::{stderr, stdout, AsyncWrite};
 use tokio::{
@@ -17,20 +23,26 @@ use tokio::{
     process::Command as SysCommand,
     select, signal, task,
 };
-use utils::{
-    ARROW_ANCHOR, BACKSPACE, BUILTINS, CTRL_C, CTRL_D, DOUBLE_QUOTES_ESCAPE, DOWN_ARROW,
-    LEFT_ARROW, RIGHT_ARROW, SHOULD_NOT_REDRAW_PROMPT, UP_ARROW,
-};
 
 pub mod autocomplete;
 pub mod command;
-mod utils;
+mod constants;
+pub mod readline;
+
+#[derive(Debug)]
+enum HistoryDirection {
+    Up,
+    Down,
+}
 
 #[derive(Debug, Default)]
 pub struct Shell {
+    pub prompt: Vec<u8>,
+    pub prompt_cursor: usize,
     pub path: String,
     pub path_executables: Vec<DirEntry>,
-    pub history: Vec<String>,
+    pub history: VecDeque<String>,
+    pub history_cursor: Option<usize>,
     pub dictionary: Trie,
     pub last_status: Option<ExitStatus>,
 }
@@ -48,10 +60,17 @@ impl Shell {
             }
         }
 
+        let history = tokio::fs::read_to_string(HISTORY_FILE)
+            .await
+            .unwrap_or(String::new());
+
         Self {
+            prompt: Vec::new(),
+            prompt_cursor: 0,
             path,
             path_executables,
-            history: vec![],
+            history: history.lines().map(|l| l.to_string()).collect(),
+            history_cursor: None,
             dictionary,
             last_status: None,
         }
@@ -63,56 +82,62 @@ impl Shell {
         let mut stdin = io::stdin();
         let mut stdout = io::stdout();
         let mut stderr = io::stderr();
-        let mut input = Vec::new();
         let mut arrow_buffer = [0u8; 2];
         let mut last_pressed = 0;
-        let mut input_cursor = 0;
 
         let mut curr_autocomplete_options: Vec<String> = vec![];
         let mut autocomplete_cursor: isize = 0;
 
         loop {
-            if input.is_empty() && !SHOULD_NOT_REDRAW_PROMPT.contains(&last_pressed) {
+            if self.prompt.is_empty() && !SHOULD_NOT_REDRAW_PROMPT.contains(&last_pressed) {
                 self.render_prompt(&mut stdout).await?;
             }
             stdout.flush().await?;
 
+            // TODO: move to separate module
             select! {
                 n = stdin.read_u8() => {
                     if let Ok(byte) = n {
                         last_pressed = byte;
                         match byte {
                             b'\r' | b'\n' => {
+                                self.history_cursor = None;
                                 stdout.write_all(b"\r\n").await?;
                                 stdout.flush().await?;
 
-                                if !input.is_empty() {
-                                    let command_str = String::from_utf8_lossy(&input);
-                                    match Command::read(command_str.trim_start(), self).await {
+                                if !self.prompt.is_empty() {
+                                    let p = &self.prompt.clone();
+                                    let command_str = String::from_utf8_lossy(p);
+                                    match Command::parse(command_str.trim_start(), self) {
                                         Ok(command) => self.run(command).await?,
                                         Err(err) => stderr.write_all(format!("{err}\r\n").as_bytes()).await?,
                                     }
-                                    self.history.push(command_str.to_string());
+                                    if self.history_cursor.is_none() {
+                                        self.history.push_front(command_str.to_string());
+                                    }
                                 }
-                                input.clear();
-                                input_cursor = 0;
+                                self.prompt.clear();
+                                self.prompt_cursor = 0;
                             },
                             CTRL_C => {
-                                input.clear();
-                                input_cursor = 0;
+                                self.prompt.clear();
+                                self.prompt_cursor = 0;
+                                self.history_cursor = None;
                                 stdout.write_all(b"\r\n").await?;
                                 stdout.flush().await?;
                             },
                             CTRL_D => {
-                                input.clear();
+                                self.prompt.clear();
+                                self.history_cursor = None;
                                 break;
                             },
                             BACKSPACE => {
+                                self.history_cursor = None;
                                 // TODO: fix bug with deleting first charachter
-                                if input_cursor != 0 {
-                                    input_cursor -= 1;
-                                    input.remove(input_cursor);
-                                    if input_cursor == input.len() {
+                                if self.prompt_cursor != 0 {
+                                    self.prompt_cursor -= 1;
+                                    self.prompt.remove(self.prompt_cursor);
+                                    if self.prompt_cursor == self.prompt.len() {
                                         stdout.write_all(b"\x08 \x08").await?;
                                     } else {
                                         let mut temp_buf = vec![];
@@ -120,9 +145,9 @@ impl Shell {
                                         stdout.write_all(&temp_buf).await?;
                                         stdout.write_all(b"\r").await?;
                                         self.render_prompt(&mut stdout).await?;
-                                        stdout.write_all(&input).await?;
+                                        stdout.write_all(&self.prompt).await?;
                                         temp_buf.clear();
-                                        execute!(temp_buf, MoveLeft(1))?;
+                                        execute!(temp_buf, MoveLeft((self.prompt.len() - self.prompt_cursor) as u16))?;
                                         stdout.write_all(&temp_buf).await?;
                                         stdout.flush().await?;
                                     }
@@ -132,17 +157,17 @@ impl Shell {
                                 if stdin.read_exact(&mut arrow_buffer).await.is_ok() {
                                     match arrow_buffer {
                                         UP_ARROW => {
-                                            self.handle_history_change(-1, &mut stdout).await?;
+                                            self.handle_history_change(HistoryDirection::Up, &mut stdout).await?;
                                         },
                                         DOWN_ARROW => {
-                                            self.handle_history_change(1, &mut stdout).await?;
+                                            self.handle_history_change(HistoryDirection::Down, &mut stdout).await?;
                                         },
-                                        RIGHT_ARROW if input_cursor < input.len() => {
+                                        RIGHT_ARROW if self.prompt_cursor < self.prompt.len() => {
                                                 stdout.write_all(&[ARROW_ANCHOR, RIGHT_ARROW[0], RIGHT_ARROW[1]]).await?;
-                                                input_cursor += 1;
+                                                self.prompt_cursor += 1;
                                         },
-                                        LEFT_ARROW  if input_cursor != 0 => {
-                                            input_cursor -= 1;
+                                        LEFT_ARROW  if self.prompt_cursor != 0 => {
+                                            self.prompt_cursor -= 1;
                                             stdout.write_all(&[ARROW_ANCHOR, LEFT_ARROW[0], LEFT_ARROW[1]]).await?;
                                         },
                                         _ => {}
@@ -150,12 +175,27 @@ impl Shell {
                                 }
                             },
                             b'\t' => {
-                                self.handle_autocomplete(&mut input, &mut input_cursor, &mut curr_autocomplete_options, &mut autocomplete_cursor, &mut stdout).await?;
+                                self.handle_autocomplete(&mut curr_autocomplete_options, &mut autocomplete_cursor, &mut stdout).await?;
                             }
                             _ => {
-                                input.push(byte);
-                                input_cursor += 1;
-                                stdout.write_all(&[byte]).await?;
+                                if !self.prompt.is_empty() && self.prompt_cursor != self.prompt.len() {
+                                    self.prompt.insert(self.prompt_cursor, byte);
+                                        let mut temp_buf = vec![];
+                                        execute!(temp_buf, Clear(ClearType::CurrentLine))?;
+                                        stdout.write_all(&temp_buf).await?;
+                                        stdout.write_all(b"\r").await?;
+                                        self.render_prompt(&mut stdout).await?;
+                                        stdout.write_all(&self.prompt).await?;
+                                        temp_buf.clear();
+                                        execute!(temp_buf, MoveLeft((self.prompt.len() - self.prompt_cursor - 1) as u16))?;
+                                        stdout.write_all(&temp_buf).await?;
+                                        stdout.flush().await?;
+                                } else {
+                                    self.prompt.push(byte);
+                                    stdout.write_all(&[byte]).await?;
+                                }
+                                self.prompt_cursor += 1;
+                                self.history_cursor = None;
                                 autocomplete_cursor = 0;
                                 curr_autocomplete_options.clear();
                             }
@@ -169,6 +209,10 @@ impl Shell {
             }
         }
         disable_raw_mode()?;
+
+        let mut history_file = Self::open_file_async(HISTORY_FILE, true).await?;
+        self.dump_history(&mut history_file).await?;
+
         Ok(())
     }
 
@@ -183,50 +227,23 @@ impl Shell {
     }
 
     pub async fn run(&mut self, command: Command) -> io::Result<()> {
-        let mut stdout: Box<dyn AsyncWrite + Unpin> = Box::new(stdout());
-        let mut stderr: Box<dyn AsyncWrite + Unpin> = Box::new(stderr());
-        // let out = match &mut command.stdout_redirect {
-        //     Some(out) => &mut stdout,
-        //     None => &mut stdout,
-        // };
-        let out = &mut stdout;
-        // let err = match &mut command.stderr_redirect {
-        //     Some(err) => todo!(),
-        //     None => &mut stderr,
-        // };
-        let err = &mut stderr;
+        let mut out: Box<dyn AsyncWrite + Unpin> = match command.stdout_redirect {
+            Some(ref out) => Box::new(
+                Shell::open_file_async(out, command.sink.map(|s| s.is_append()).unwrap_or(false))
+                    .await?,
+            ),
+            None => Box::new(stdout()),
+        };
+        let mut err: Box<dyn AsyncWrite + Unpin> = match command.stderr_redirect {
+            Some(ref err) => Box::new(
+                Shell::open_file_async(err, command.sink.map(|s| s.is_append()).unwrap_or(false))
+                    .await?,
+            ),
+            None => Box::new(stderr()),
+        };
 
         match command.kind {
             CommandKind::Exit { status_code } => exit(status_code),
-            CommandKind::Echo { msg } => {
-                out.write_all(format!("{}\r\n", msg.join(" ")).as_bytes())
-                    .await?;
-            }
-            CommandKind::Type { arg } => match arg.as_ref() {
-                c if matches!(c, "exit" | "echo" | "type" | "pwd") => {
-                    out.write_all(format!("{c} is a shell builtin\r\n").as_bytes())
-                        .await?;
-                }
-                c if self.get_path_executable(c).is_some() => {
-                    let entry = self
-                        .get_path_executable(c)
-                        .ok_or(io::Error::other("Can not get path executable "))?;
-                    out.write_all(
-                        format!("{c} is {}\r\n", entry.path().as_path().to_string_lossy())
-                            .as_bytes(),
-                    )
-                    .await?;
-                }
-                c => {
-                    err.write_all(format!("{c}: not found\r\n").as_bytes())
-                        .await?;
-                }
-            },
-            CommandKind::Pwd => {
-                let pwd = std::env::current_dir()?;
-                out.write_all(format!("{}\r\n", pwd.display()).as_bytes())
-                    .await?;
-            }
             CommandKind::ExternalCommand { name, input } => {
                 let canonicalized_name = self
                     .canonicalize_path(
@@ -238,16 +255,14 @@ impl Shell {
                 let stdout = command
                     .stdout_redirect
                     .and_then(|stdout| {
-                        Self::open_redirect_file(stdout, command.sink == Some(Sink::StdoutAppend))
-                            .ok()
+                        Self::open_file(stdout, command.sink == Some(Sink::StdoutAppend)).ok()
                     })
                     .map(Stdio::from)
                     .unwrap_or(Stdio::inherit());
                 let stderr = command
                     .stderr_redirect
                     .and_then(|stderr| {
-                        Self::open_redirect_file(stderr, command.sink == Some(Sink::StderrAppend))
-                            .ok()
+                        Self::open_file(stderr, command.sink == Some(Sink::StderrAppend)).ok()
                     })
                     .map(Stdio::from)
                     .unwrap_or(Stdio::inherit());
@@ -277,8 +292,7 @@ impl Shell {
                 }
             }
             CommandKind::History => {
-                out.write_all(format!("{}\r\n", self.history.join("\r\n")).as_bytes())
-                    .await?
+                self.dump_history(&mut out).await?;
             }
         }
 
@@ -294,7 +308,7 @@ impl Shell {
         Some(path.as_ref().to_string())
     }
 
-    pub fn parse_args(args: &str) -> Vec<String> {
+    pub fn parse_prompt(args: &str) -> Vec<String> {
         let mut parsed_args = Vec::new();
         let mut current_arg = String::new();
         let mut in_single_quotes = false;
@@ -303,6 +317,9 @@ impl Shell {
         let mut chars = args.chars().peekable();
         while let Some(c) = chars.next() {
             match c {
+                '|' if !in_single_quotes && !in_double_quotes => {
+                    parsed_args.push("|".to_string());
+                }
                 '\'' if !in_double_quotes => in_single_quotes = !in_single_quotes,
                 '"' if !in_single_quotes => {
                     in_double_quotes = !in_double_quotes;
@@ -338,14 +355,12 @@ impl Shell {
 
     async fn handle_autocomplete(
         &mut self,
-        input: &mut Vec<u8>,
-        cursor: &mut usize,
         autocomplete_options: &mut Vec<String>,
         autocomplete_cursor: &mut isize,
         stdout: &mut Stdout,
     ) -> io::Result<()> {
-        let command_str =
-            std::str::from_utf8(input).map_err(|_| io::Error::other("Input is not valid utf-8"))?;
+        let command_str = std::str::from_utf8(&self.prompt)
+            .map_err(|_| io::Error::other("Input is not valid utf-8"))?;
 
         if !autocomplete_options.is_empty() {
             if *autocomplete_cursor < 0 {
@@ -363,12 +378,12 @@ impl Shell {
             stdout.write_all(suffix.as_bytes()).await?;
             stdout.write_u8(b' ').await?;
 
-            input.clear();
-            input.extend(suffix.as_bytes());
-            input.push(b' ');
+            self.prompt.clear();
+            self.prompt.extend(suffix.as_bytes());
+            self.prompt.push(b' ');
 
             *autocomplete_cursor -= 1;
-            *cursor = suffix.len() + 1;
+            self.prompt_cursor = suffix.len() + 1;
             return Ok(());
         }
 
@@ -382,13 +397,13 @@ impl Shell {
         stdout.write_u8(b' ').await?;
 
         for c in suffix.chars() {
-            input.push(c as u8);
+            self.prompt.push(c as u8);
         }
-        input.push(b' ');
+        self.prompt.push(b' ');
 
         *autocomplete_options = suggestions;
         *autocomplete_cursor = autocomplete_options.len() as isize - 1;
-        *cursor += suffix.len() + 1;
+        self.prompt_cursor += suffix.len() + 1;
 
         Ok(())
     }
@@ -441,22 +456,75 @@ impl Shell {
 
     async fn handle_history_change<S: AsyncWrite + Unpin>(
         &mut self,
-        _to: i8,
+        to: HistoryDirection,
         sink: &mut S,
     ) -> io::Result<()> {
+        let command: Option<&String> = match (to, &mut self.history_cursor) {
+            (HistoryDirection::Up, None) if !self.history.is_empty() => {
+                let command = self.history.front();
+                self.history_cursor = Some(0);
+                command
+            }
+            (HistoryDirection::Up, Some(ref mut cursor)) => {
+                let command = self.history.get(*cursor + 1);
+                *cursor += 1;
+                command
+            }
+            (HistoryDirection::Down, Some(ref mut cursor)) => {
+                let command = self.history.get(*cursor - 1);
+                *cursor -= 1;
+                command
+            }
+            _ => None,
+        };
+
+        let Some(command) = command.cloned() else {
+            if self.history.is_empty() && self.history_cursor.is_some() {
+                self.history_cursor = None;
+            }
+            return Ok(());
+        };
+
+        self.prompt.clear();
+        self.prompt.extend_from_slice(command.as_bytes());
+        self.prompt_cursor = self.prompt.len();
         sink.write_all(b"\r\x1b[K").await?;
         self.render_prompt(sink).await?;
+        sink.write_all(command.as_bytes()).await?;
 
         Ok(())
     }
 
-    pub fn open_redirect_file(to: String, append: bool) -> std::io::Result<File> {
+    fn open_file<P: AsRef<Path>>(path: P, append: bool) -> std::io::Result<File> {
         OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .append(append)
             .truncate(!append)
-            .open(to)
+            .open(path)
+    }
+
+    async fn open_file_async<P: AsRef<Path>>(path: P, append: bool) -> io::Result<tokio::fs::File> {
+        tokio::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .append(append)
+            .truncate(!append)
+            .open(path)
+            .await
+    }
+
+    pub async fn dump_history<S: AsyncWrite + Unpin>(&mut self, sink: &mut S) -> io::Result<()> {
+        if let Some(history) = self.history.iter_mut().reduce(|acc, next| {
+            acc.push_str("\r\n");
+            acc.push_str(next);
+            acc
+        }) {
+            sink.write_all(format!("{}\r\n", history).as_bytes())
+                .await?;
+        }
+        Ok(())
     }
 }

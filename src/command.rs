@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 
-use crate::{utils::REDIRECTS, Shell};
+use crate::{constants::REDIRECTS, Shell};
 use thiserror::Error;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -11,22 +11,32 @@ pub enum Sink {
     StderrAppend,
 }
 
+impl Sink {
+    pub fn is_append(&self) -> bool {
+        match self {
+            Sink::Stdout => false,
+            Sink::Stderr => false,
+            Sink::StdoutAppend => true,
+            Sink::StderrAppend => true,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum CommandKind {
     Exit { status_code: i32 },
-    Echo { msg: Vec<String> },
-    Type { arg: String },
-    Pwd,
     Cd { path: String },
     ExternalCommand { name: OsString, input: Vec<String> },
     History,
 }
 
+#[derive(Debug)]
 pub struct Command {
     pub kind: CommandKind,
     pub stdout_redirect: Option<String>,
     pub stderr_redirect: Option<String>,
     pub sink: Option<Sink>,
+    pub pipe_to: Option<Box<Command>>,
 }
 
 #[derive(Debug, Error)]
@@ -39,9 +49,26 @@ pub enum CommandError {
 }
 
 impl Command {
-    pub async fn read(input: &str, shell: &Shell) -> Result<Command, CommandError> {
+    pub fn parse(input: &str, shell: &Shell) -> Result<Command, CommandError> {
+        let args = Shell::parse_prompt(input);
+        let subcommand_strs = args.split(|a| a == "|");
+
+        let mut commands = vec![];
+
+        for subcommand_str in subcommand_strs {
+            commands.push(Self::read(subcommand_str.to_vec(), shell)?);
+        }
+
+        let command = commands.into_iter().reduce(|mut acc, next| {
+            acc.pipe_to = Some(Box::new(next));
+            acc
+        });
+
+        Ok(command.unwrap())
+    }
+
+    pub fn read(mut args: Vec<String>, shell: &Shell) -> Result<Command, CommandError> {
         use CommandKind::*;
-        let mut args = Shell::parse_args(input);
 
         let redirect_pos = args.iter().position(|a| REDIRECTS.contains(&a.as_str()));
         let redirect_to = redirect_pos.map(|pos| args[pos + 1].clone());
@@ -69,13 +96,6 @@ impl Command {
                     None => 0,
                 },
             }),
-            "echo" => Ok(Echo {
-                msg: args[1..].to_owned(),
-            }),
-            "type" => Ok(Type {
-                arg: args[1].to_string(),
-            }),
-            "pwd" => Ok(Pwd),
             "cd" => Ok(Cd {
                 path: args[1].to_string(),
             }),
@@ -97,18 +117,21 @@ impl Command {
                 stdout_redirect: Some(to),
                 stderr_redirect: None,
                 sink,
+                pipe_to: None,
             }),
             (Some(to), Some(Sink::Stderr | Sink::StderrAppend)) => Ok(Command {
                 kind: kind?,
                 stdout_redirect: None,
                 stderr_redirect: Some(to),
                 sink,
+                pipe_to: None,
             }),
             _ => Ok(Command {
                 kind: kind?,
                 stdout_redirect: None,
                 stderr_redirect: None,
                 sink,
+                pipe_to: None,
             }),
         }
     }

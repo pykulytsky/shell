@@ -3,10 +3,11 @@
 use autocomplete::Trie;
 use command::{Command, CommandKind, Sink};
 use constants::{
-    ARROW_ANCHOR, BACKSPACE, BUILTINS, CTRL_C, CTRL_D, DOUBLE_QUOTES_ESCAPE, DOWN_ARROW,
-    HISTORY_FILE, LEFT_ARROW, RIGHT_ARROW, SHOULD_NOT_REDRAW_PROMPT, UP_ARROW,
+    ARROW_ANCHOR, BACKSPACE, BUILTINS, CTRL_C, CTRL_D, CTRL_LEFT_ARROW, CTRL_RIGHT_ARROW,
+    DOUBLE_QUOTES_ESCAPE, DOWN_ARROW, HISTORY_FILE, LEFT_ARROW, RIGHT_ARROW,
+    SHOULD_NOT_REDRAW_PROMPT, UP_ARROW,
 };
-use crossterm::cursor::MoveLeft;
+use crossterm::cursor::{MoveLeft, MoveRight};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use std::collections::VecDeque;
@@ -28,6 +29,15 @@ pub mod autocomplete;
 pub mod command;
 mod constants;
 pub mod readline;
+
+#[macro_export]
+macro_rules! debug {
+    ($($input:tt)*) => {
+        disable_raw_mode().unwrap();
+        println!($($input)*);
+        enable_raw_mode().unwrap();
+    };
+}
 
 #[derive(Debug)]
 enum HistoryDirection {
@@ -83,6 +93,7 @@ impl Shell {
         let mut stdout = io::stdout();
         let mut stderr = io::stderr();
         let mut arrow_buffer = [0u8; 2];
+        let mut ctrl_arrow_buffer = [0u8; 2];
         let mut last_pressed = 0;
 
         let mut curr_autocomplete_options: Vec<String> = vec![];
@@ -166,7 +177,7 @@ impl Shell {
                                                 stdout.write_all(&[ARROW_ANCHOR, RIGHT_ARROW[0], RIGHT_ARROW[1]]).await?;
                                                 self.prompt_cursor += 1;
                                         },
-                                        LEFT_ARROW  if self.prompt_cursor != 0 => {
+                                        LEFT_ARROW if self.prompt_cursor != 0 => {
                                             self.prompt_cursor -= 1;
                                             stdout.write_all(&[ARROW_ANCHOR, LEFT_ARROW[0], LEFT_ARROW[1]]).await?;
                                         },
@@ -174,6 +185,19 @@ impl Shell {
                                     }
                                 }
                             },
+                            b';' => {
+                                if stdin.read_exact(&mut ctrl_arrow_buffer).await.is_ok() {
+                                    match ctrl_arrow_buffer {
+                                        CTRL_LEFT_ARROW if self.prompt_cursor != 0 => {
+                                            self.move_cursor_word_left(&mut stdout).await?;
+                                        }
+                                        CTRL_RIGHT_ARROW if self.prompt_cursor < self.prompt.len() => {
+                                            self.move_cursor_word_right(&mut stdout).await?;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
                             b'\t' => {
                                 self.handle_autocomplete(&mut curr_autocomplete_options, &mut autocomplete_cursor, &mut stdout).await?;
                             }
@@ -525,6 +549,50 @@ impl Shell {
             sink.write_all(format!("{}\r\n", history).as_bytes())
                 .await?;
         }
+        Ok(())
+    }
+
+    async fn move_cursor_word_left<S: AsyncWrite + Unpin>(
+        &mut self,
+        sink: &mut S,
+    ) -> io::Result<()> {
+        let mut temp_buf = vec![];
+        if let Some(pos) = self.prompt[..self.prompt_cursor - 1]
+            .iter()
+            .rposition(|c| *c == b' ')
+        {
+            execute!(
+                temp_buf,
+                MoveLeft(self.prompt_cursor as u16 - pos as u16 - 1)
+            )?;
+            self.prompt_cursor = pos + 1;
+        } else {
+            execute!(temp_buf, MoveLeft(self.prompt_cursor as u16))?;
+            self.prompt_cursor = 0;
+        }
+        sink.write_all(&temp_buf).await?;
+        Ok(())
+    }
+
+    async fn move_cursor_word_right<S: AsyncWrite + Unpin>(
+        &mut self,
+        sink: &mut S,
+    ) -> io::Result<()> {
+        let mut temp_buf = vec![];
+        if let Some(pos) = self.prompt[self.prompt_cursor + 1..]
+            .iter()
+            .position(|c| *c == b' ')
+        {
+            execute!(temp_buf, MoveRight(pos as u16 + 1))?;
+            self.prompt_cursor = pos + self.prompt_cursor + 1;
+        } else {
+            execute!(
+                temp_buf,
+                MoveRight(self.prompt.len() as u16 - self.prompt_cursor as u16)
+            )?;
+            self.prompt_cursor = self.prompt.len();
+        }
+        sink.write_all(&temp_buf).await?;
         Ok(())
     }
 }

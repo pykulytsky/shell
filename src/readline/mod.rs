@@ -5,8 +5,14 @@ use crate::{
         ARROW_ANCHOR, BACKSPACE, CTRL_C, CTRL_D, CTRL_LEFT_ARROW, CTRL_RIGHT_ARROW, DOWN_ARROW,
         HISTORY_FILE, LEFT_ARROW, RIGHT_ARROW, SHOULD_NOT_REDRAW_PROMPT, UP_ARROW,
     },
-    HistoryDirection,
 };
+
+#[derive(Debug)]
+pub enum HistoryDirection {
+    Up,
+    Down,
+}
+
 use crossterm::{
     cursor::{MoveLeft, MoveRight},
     execute,

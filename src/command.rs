@@ -90,44 +90,43 @@ impl Command {
         }
 
         let kind = match args[0].as_str() {
-            "exit" => Ok(Exit {
+            "exit" => Exit {
                 status_code: match args.get(1) {
                     Some(status_code) => status_code.parse::<i32>()?,
                     None => 0,
                 },
-            }),
-            "cd" => Ok(Cd {
+            },
+            "cd" => Cd {
                 path: args[1].to_string(),
-            }),
-            "history" => Ok(History),
-            arg if shell.get_path_executable(arg).is_some() => Ok(ExternalCommand {
+            },
+            "history" => History,
+            arg => ExternalCommand {
                 name: shell
                     .get_path_executable(arg)
                     .unwrap()
                     .path()
                     .into_os_string(),
                 input: args[1..].to_owned(),
-            }),
-            arg => Err(CommandError::InvalidCommand(arg.to_string())),
+            },
         };
 
         match (redirect_to, sink) {
             (Some(to), Some(Sink::Stdout | Sink::StdoutAppend)) => Ok(Command {
-                kind: kind?,
+                kind,
                 stdout_redirect: Some(to),
                 stderr_redirect: None,
                 sink,
                 pipe_to: None,
             }),
             (Some(to), Some(Sink::Stderr | Sink::StderrAppend)) => Ok(Command {
-                kind: kind?,
+                kind,
                 stdout_redirect: None,
                 stderr_redirect: Some(to),
                 sink,
                 pipe_to: None,
             }),
             _ => Ok(Command {
-                kind: kind?,
+                kind,
                 stdout_redirect: None,
                 stderr_redirect: None,
                 sink,

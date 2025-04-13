@@ -28,6 +28,7 @@ use tokio::{
 pub mod autocomplete;
 pub mod command;
 mod constants;
+pub mod prompt;
 pub mod readline;
 
 #[macro_export]

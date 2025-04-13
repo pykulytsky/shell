@@ -20,7 +20,6 @@ pub const LEFT_ARROW: [u8; 2] = [91, 68];
 pub const CTRL_LEFT_ARROW: [u8; 2] = [51, 68];
 pub const CTRL_RIGHT_ARROW: [u8; 2] = [51, 67];
 
-
 pub const SHOULD_NOT_REDRAW_PROMPT: &[u8] = &[BACKSPACE, ARROW_ANCHOR];
 
 pub const BUILTINS: &[&str] = &["cd", "exit", "echo", "type", "pwd", "history"];

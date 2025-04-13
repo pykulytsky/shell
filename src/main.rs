@@ -1,4 +1,4 @@
-use codecrafters_shell::Shell;
+use shell::Shell;
 
 #[tokio::main]
 async fn main() {

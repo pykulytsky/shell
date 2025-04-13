@@ -2,14 +2,14 @@
 
 use autocomplete::Trie;
 use command::{Command, CommandKind, Sink};
-use constants::{
+use crossterm::cursor::{MoveLeft, MoveRight};
+use crossterm::execute;
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
+use readline::constants::{
     ARROW_ANCHOR, BACKSPACE, BUILTINS, CTRL_C, CTRL_D, CTRL_LEFT_ARROW, CTRL_RIGHT_ARROW,
     DOUBLE_QUOTES_ESCAPE, DOWN_ARROW, HISTORY_FILE, LEFT_ARROW, RIGHT_ARROW,
     SHOULD_NOT_REDRAW_PROMPT, UP_ARROW,
 };
-use crossterm::cursor::{MoveLeft, MoveRight};
-use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use std::collections::VecDeque;
 use std::env::current_dir;
 use std::fs::File;
@@ -27,7 +27,6 @@ use tokio::{
 
 pub mod autocomplete;
 pub mod command;
-mod constants;
 pub mod prompt;
 pub mod readline;
 

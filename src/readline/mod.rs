@@ -1,10 +1,10 @@
 use crate::{
     autocomplete::Trie,
-    constants::{
+    prompt::{DefaultPrompt, Prompt},
+    readline::constants::{
         ARROW_ANCHOR, BACKSPACE, CTRL_C, CTRL_D, CTRL_LEFT_ARROW, CTRL_RIGHT_ARROW, DOWN_ARROW,
         HISTORY_FILE, LEFT_ARROW, RIGHT_ARROW, SHOULD_NOT_REDRAW_PROMPT, UP_ARROW,
     },
-    prompt::{DefaultPrompt, Prompt},
     HistoryDirection,
 };
 use crossterm::{
@@ -18,6 +18,7 @@ use tokio::{
     select,
 };
 
+pub mod constants;
 pub mod signal;
 
 use signal::Signal;

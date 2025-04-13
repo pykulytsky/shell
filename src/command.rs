@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 
-use crate::{constants::REDIRECTS, Shell};
+use crate::{readline::constants::REDIRECTS, Shell};
 use thiserror::Error;
 
 #[derive(Debug, PartialEq, Clone, Copy)]

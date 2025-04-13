@@ -7,7 +7,6 @@ use prompt::DirPrompt;
 use readline::constants::{BUILTINS, DOUBLE_QUOTES_ESCAPE, HISTORY_FILE};
 use readline::signal::Signal;
 use readline::Readline;
-use std::collections::VecDeque;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::os::unix::fs::PermissionsExt;
@@ -39,8 +38,6 @@ macro_rules! debug {
 pub struct Shell {
     path: String,
     path_executables: Vec<DirEntry>,
-    history: VecDeque<String>,
-    history_cursor: Option<usize>,
     last_status: Option<ExitStatus>,
 }
 
@@ -58,15 +55,9 @@ impl Shell {
             }
         }
 
-        let history = tokio::fs::read_to_string(HISTORY_FILE)
-            .await
-            .unwrap_or(String::new());
-
         Self {
             path,
             path_executables,
-            history: history.lines().map(|l| l.to_string()).collect(),
-            history_cursor: None,
             last_status: None,
         }
     }
@@ -84,9 +75,6 @@ impl Shell {
             match Command::parse(input.trim_start(), self) {
                 Ok(command) => self.run(command).await?,
                 Err(err) => stderr.write_all(format!("{err}\r\n").as_bytes()).await?,
-            }
-            if self.history_cursor.is_none() {
-                self.history.push_front(input.to_string());
             }
         }
 
@@ -287,15 +275,17 @@ impl Shell {
             .await
     }
 
-    async fn dump_history<S: AsyncWrite + Unpin>(&mut self, sink: &mut S) -> io::Result<()> {
-        if let Some(history) = self.history.iter_mut().reduce(|acc, next| {
-            acc.push_str("\r\n");
-            acc.push_str(next);
-            acc
-        }) {
-            sink.write_all(format!("{}\r\n", history).as_bytes())
-                .await?;
-        }
+    async fn dump_history<S: AsyncWrite + Unpin>(&mut self, _sink: &mut S) -> io::Result<()> {
+        // [TODO] update this function with regards to the fact that history is now handled by
+        // `Readline`
+        // if let Some(history) = self.history.iter_mut().reduce(|acc, next| {
+        //     acc.push_str("\r\n");
+        //     acc.push_str(next);
+        //     acc
+        // }) {
+        //     sink.write_all(format!("{}\r\n", history).as_bytes())
+        //         .await?;
+        // }
         Ok(())
     }
 }

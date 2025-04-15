@@ -219,6 +219,15 @@ impl Shell {
         }
 
         parsed_args
+            .into_iter()
+            .map(|arg| {
+                if arg.starts_with("$") {
+                    std::env::var(&arg.as_str()[1..]).unwrap_or(arg)
+                } else {
+                    arg
+                }
+            })
+            .collect()
     }
 
     async fn populate_path_executables(path: &str) -> Vec<DirEntry> {

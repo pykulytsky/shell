@@ -49,14 +49,14 @@ pub enum CommandError {
 }
 
 impl Command {
-    pub fn parse(input: &str, shell: &Shell) -> Result<Command, CommandError> {
+    pub async fn parse(input: &str, shell: &Shell) -> Result<Command, CommandError> {
         let args = Shell::parse_prompt(input);
         let subcommand_strs = args.split(|a| a == "|");
 
         let mut commands = vec![];
 
         for subcommand_str in subcommand_strs {
-            commands.push(Self::read(subcommand_str.to_vec(), shell)?);
+            commands.push(Self::read(subcommand_str.to_vec(), shell).await?);
         }
 
         let command = commands.into_iter().reduce(|mut acc, next| {
@@ -67,7 +67,7 @@ impl Command {
         Ok(command.unwrap())
     }
 
-    pub fn read(mut args: Vec<String>, shell: &Shell) -> Result<Command, CommandError> {
+    pub async fn read(mut args: Vec<String>, shell: &Shell) -> Result<Command, CommandError> {
         use CommandKind::*;
 
         let redirect_pos = args.iter().position(|a| REDIRECTS.contains(&a.as_str()));
@@ -103,6 +103,7 @@ impl Command {
             arg => ExternalCommand {
                 name: shell
                     .get_path_executable(arg)
+                    .await
                     .ok_or(CommandError::InvalidCommand(arg.to_string()))?
                     .path()
                     .into_os_string(),

@@ -72,9 +72,11 @@ impl Shell {
                 break;
             }
 
-            match Command::parse(input.trim_start(), self) {
-                Ok(command) => self.execute(command).await?,
-                Err(err) => stderr.write_all(format!("{err}\r\n").as_bytes()).await?,
+            if !input.is_empty() {
+                match Command::parse(input.trim_start(), self).await {
+                    Ok(command) => self.execute(command).await?,
+                    Err(err) => stderr.write_all(format!("{err}\r\n").as_bytes()).await?,
+                }
             }
         }
 
@@ -84,7 +86,7 @@ impl Shell {
         Ok(())
     }
 
-    fn get_path_executable(&self, name: &str) -> Option<&DirEntry> {
+    async fn get_path_executable(&self, name: &str) -> Option<&DirEntry> {
         self.path_executables.iter().find(|e| {
             e.path()
                 .components()
@@ -92,6 +94,26 @@ impl Shell {
                 .and_then(|p| p.as_os_str().to_str())
                 == Some(name)
         })
+    }
+
+    pub async fn get_local_executable(&self, name: &str) -> Option<DirEntry> {
+        let current_dir = std::env::current_dir().ok()?;
+        let mut local_executables = vec![];
+
+        while let Ok(Some(entry)) = read_dir(&current_dir).await.ok()?.next_entry().await {
+            if let Ok(metadata) = entry.metadata().await {
+                if (metadata.is_file() || metadata.is_symlink())
+                    && metadata.permissions().mode() & 0o111 != 0
+                {
+                    if entry.file_name() == name {
+                        return Some(entry);
+                    }
+                    local_executables.push(entry);
+                }
+            }
+        }
+
+        None
     }
 
     pub async fn execute(&mut self, command: Command) -> io::Result<()> {

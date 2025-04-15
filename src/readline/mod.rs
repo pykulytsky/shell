@@ -142,7 +142,7 @@ impl<P: Prompt> Readline<P> {
                                         CTRL_RIGHT_ARROW if self.input_cursor < self.input.len() => {
                                             self.move_cursor_word_right(&mut stdout).await?;
                                         }
-                                        _ => {}
+                                        _ => { }
                                     }
                                 }
                             }

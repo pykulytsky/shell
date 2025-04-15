@@ -7,10 +7,13 @@ use prompt::DirPrompt;
 use readline::constants::{BUILTINS, DOUBLE_QUOTES_ESCAPE, HISTORY_FILE};
 use readline::signal::Signal;
 use readline::Readline;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::future::Future;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::pin::Pin;
 use std::process::{exit, ExitStatus, Stdio};
 use tokio::io::{stderr, stdout, AsyncWrite};
 use tokio::{
@@ -134,39 +137,12 @@ impl Shell {
 
         match command.kind {
             CommandKind::Exit { status_code } => exit(status_code),
-            CommandKind::ExternalCommand { name, input } => {
-                let canonicalized_name = self
-                    .canonicalize_path(
-                        name.to_str()
-                            .ok_or(io::Error::other("Can not convert name to string"))?,
-                    )
-                    .ok_or(io::Error::other("Can not canonicalize path"))?;
-                disable_raw_mode()?;
-                let stdout = command
-                    .stdout_redirect
-                    .and_then(|stdout| {
-                        Self::open_file(stdout, command.sink == Some(Sink::StdoutAppend)).ok()
-                    })
-                    .map(Stdio::from)
-                    .unwrap_or(Stdio::inherit());
-                let stderr = command
-                    .stderr_redirect
-                    .and_then(|stderr| {
-                        Self::open_file(stderr, command.sink == Some(Sink::StderrAppend)).ok()
-                    })
-                    .map(Stdio::from)
-                    .unwrap_or(Stdio::inherit());
-
-                let mut child = SysCommand::new(canonicalized_name)
-                    .args(input)
-                    .stdin(Stdio::inherit())
-                    .stdout(stdout)
-                    .stderr(stderr)
-                    .spawn()?;
-
-                let status = child.wait().await?;
-                enable_raw_mode()?;
-                self.last_status = Some(status);
+            CommandKind::ExternalCommand {
+                ref name,
+                ref input,
+            } => {
+                self.execute_external_command(command.clone(), name.clone(), input, None)
+                    .await?;
             }
             CommandKind::Cd { path } => {
                 let home = std::env::var("HOME").unwrap();
@@ -187,6 +163,91 @@ impl Shell {
         }
 
         Ok(())
+    }
+
+    fn execute_external_command<'a, I, S>(
+        &'a mut self,
+        command: Command,
+        name: OsString,
+        input: I,
+        pipe_input: Option<Vec<u8>>,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + 'a>>
+    where
+        I: IntoIterator<Item = S> + 'a,
+        S: AsRef<OsStr>,
+    {
+        Box::pin(async move {
+            let canonicalized_name = self
+                .canonicalize_path(
+                    name.to_str()
+                        .ok_or(io::Error::other("Can not convert name to string"))?,
+                )
+                .ok_or(io::Error::other("Can not canonicalize path"))?;
+            disable_raw_mode()?;
+            let stdout = if command.pipe_to.is_some() {
+                Stdio::piped()
+            } else {
+                command
+                    .stdout_redirect
+                    .and_then(|stdout| {
+                        Self::open_file(stdout, command.sink == Some(Sink::StdoutAppend)).ok()
+                    })
+                    .map(Stdio::from)
+                    .unwrap_or(Stdio::inherit())
+            };
+            let stderr = command
+                .stderr_redirect
+                .and_then(|stderr| {
+                    Self::open_file(stderr, command.sink == Some(Sink::StderrAppend)).ok()
+                })
+                .map(Stdio::from)
+                .unwrap_or(Stdio::inherit());
+
+            let mut child = SysCommand::new(canonicalized_name)
+                .args(input)
+                .stdin(if pipe_input.is_some() {
+                    Stdio::piped()
+                } else {
+                    Stdio::inherit()
+                })
+                .stdout(stdout)
+                .stderr(stderr)
+                .spawn()?;
+
+            if let Some(pipe_input) = pipe_input {
+                if let Some(ref mut stdin) = child.stdin {
+                    stdin.write_all(&pipe_input).await?;
+                }
+            }
+
+            // let status = child.wait().await?;
+
+            // self.last_status = Some(status);
+
+            if let Some(sub) = command.pipe_to {
+                if let CommandKind::ExternalCommand {
+                    ref name,
+                    ref input,
+                } = sub.kind
+                {
+                    let output = child.wait_with_output().await?;
+                    self.execute_external_command(
+                        *sub.clone(),
+                        name.to_owned(),
+                        input.to_owned(),
+                        Some(output.stdout),
+                    )
+                    .await?;
+                    self.last_status = Some(output.status);
+                }
+            } else {
+                let status = child.wait().await?;
+                self.last_status = Some(status);
+            }
+            enable_raw_mode()?;
+
+            Ok(())
+        })
     }
 
     pub fn canonicalize_path<P: AsRef<str> + ?Sized>(&self, path: &P) -> Option<String> {

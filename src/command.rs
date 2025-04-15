@@ -22,7 +22,7 @@ impl Sink {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum CommandKind {
     Exit { status_code: i32 },
     Cd { path: String },
@@ -30,7 +30,7 @@ pub enum CommandKind {
     History,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Command {
     pub kind: CommandKind,
     pub stdout_redirect: Option<String>,

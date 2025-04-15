@@ -73,13 +73,13 @@ impl Shell {
             }
 
             match Command::parse(input.trim_start(), self) {
-                Ok(command) => self.run(command).await?,
+                Ok(command) => self.execute(command).await?,
                 Err(err) => stderr.write_all(format!("{err}\r\n").as_bytes()).await?,
             }
         }
 
         let mut history_file = Self::open_file_async(HISTORY_FILE, true).await?;
-        self.dump_history(&mut history_file).await?;
+        readline.dump_history(&mut history_file).await?;
 
         Ok(())
     }
@@ -94,7 +94,7 @@ impl Shell {
         })
     }
 
-    pub async fn run(&mut self, command: Command) -> io::Result<()> {
+    pub async fn execute(&mut self, command: Command) -> io::Result<()> {
         let mut out: Box<dyn AsyncWrite + Unpin> = match command.stdout_redirect {
             Some(ref out) => Box::new(
                 Shell::open_file_async(out, command.sink.map(|s| s.is_append()).unwrap_or(false))

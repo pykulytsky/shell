@@ -429,4 +429,19 @@ impl<P: Prompt> Readline<P> {
         }
         Ok(())
     }
+
+    pub(crate) async fn dump_history<S: AsyncWrite + Unpin>(
+        &mut self,
+        sink: &mut S,
+    ) -> io::Result<()> {
+        if let Some(history) = self.history.iter_mut().reduce(|acc, next| {
+            acc.push_str("\r\n");
+            acc.push_str(next);
+            acc
+        }) {
+            sink.write_all(format!("{}\r\n", history).as_bytes())
+                .await?;
+        }
+        Ok(())
+    }
 }

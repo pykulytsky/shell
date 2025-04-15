@@ -103,7 +103,7 @@ impl Command {
             arg => ExternalCommand {
                 name: shell
                     .get_path_executable(arg)
-                    .unwrap()
+                    .ok_or(CommandError::InvalidCommand(arg.to_string()))?
                     .path()
                     .into_os_string(),
                 input: args[1..].to_owned(),

@@ -95,7 +95,6 @@ impl<P: Prompt> Readline<P> {
                     prompt.draw(&mut stdout).await?;
                 }
             }
-            stdout.flush().await?;
 
             select! {
                 n = stdin.read_u8() => {
@@ -387,11 +386,11 @@ impl<P: Prompt> Readline<P> {
                 MoveLeft((self.input.len() - self.input_cursor - 1) as u16)
             )?;
             s.write_all(&temp_buf).await?;
-            s.flush().await?;
         } else {
             self.input.push(byte);
             s.write_all(&[byte]).await?;
         }
+        s.flush().await?;
         self.input_cursor += 1;
         self.history_cursor = None;
         // [TODO]

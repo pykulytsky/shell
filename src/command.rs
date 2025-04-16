@@ -59,12 +59,15 @@ impl Command {
             commands.push(Self::read(subcommand_str.to_vec(), shell).await?);
         }
 
-        let command = commands.into_iter().reduce(|mut acc, next| {
-            acc.pipe_to = Some(Box::new(next));
-            acc
-        });
+        let mut iter = commands.into_iter().rev();
+        let mut command = iter.next().unwrap();
 
-        Ok(command.unwrap())
+        for mut prev in iter {
+            prev.pipe_to = Some(Box::new(command));
+            command = prev;
+        }
+
+        Ok(command)
     }
 
     pub async fn read(mut args: Vec<String>, shell: &Shell) -> Result<Command, CommandError> {
@@ -100,15 +103,20 @@ impl Command {
                 path: args[1].to_string(),
             },
             "history" => History,
-            arg => ExternalCommand {
-                name: shell
+            arg => {
+                let name = shell
                     .get_path_executable(arg)
                     .await
+                    .or(shell.get_local_executable(arg).await.as_ref())
                     .ok_or(CommandError::InvalidCommand(arg.to_string()))?
                     .path()
-                    .into_os_string(),
-                input: args[1..].to_owned(),
-            },
+                    .into_os_string();
+
+                ExternalCommand {
+                    name,
+                    input: args[1..].to_owned(),
+                }
+            }
         };
 
         match (redirect_to, sink) {

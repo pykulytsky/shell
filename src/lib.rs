@@ -103,7 +103,8 @@ impl Shell {
         let current_dir = std::env::current_dir().ok()?;
         let mut local_executables = vec![];
 
-        while let Ok(Some(entry)) = read_dir(&current_dir).await.ok()?.next_entry().await {
+        let mut dir = read_dir(&current_dir).await.ok()?;
+        while let Ok(Some(entry)) = dir.next_entry().await {
             if let Ok(metadata) = entry.metadata().await {
                 if (metadata.is_file() || metadata.is_symlink())
                     && metadata.permissions().mode() & 0o111 != 0
@@ -203,13 +204,14 @@ impl Shell {
                 .map(Stdio::from)
                 .unwrap_or(Stdio::inherit());
 
+            let stdin = if pipe_input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::inherit()
+            };
             let mut child = SysCommand::new(canonicalized_name)
                 .args(input)
-                .stdin(if pipe_input.is_some() {
-                    Stdio::piped()
-                } else {
-                    Stdio::inherit()
-                })
+                .stdin(stdin)
                 .stdout(stdout)
                 .stderr(stderr)
                 .spawn()?;
@@ -219,10 +221,6 @@ impl Shell {
                     stdin.write_all(&pipe_input).await?;
                 }
             }
-
-            // let status = child.wait().await?;
-
-            // self.last_status = Some(status);
 
             if let Some(sub) = command.pipe_to {
                 if let CommandKind::ExternalCommand {

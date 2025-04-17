@@ -2,8 +2,8 @@ use crate::{
     autocomplete::Trie,
     prompt::{DefaultPrompt, Prompt},
     readline::constants::{
-        ARROW_ANCHOR, BACKSPACE, CTRL_C, CTRL_D, CTRL_LEFT_ARROW, CTRL_RIGHT_ARROW, DOWN_ARROW,
-        HISTORY_FILE, LEFT_ARROW, RIGHT_ARROW, SHOULD_NOT_REDRAW_PROMPT, UP_ARROW,
+        ARROW_ANCHOR, BACKSPACE, CTRL_C, CTRL_D, CTRL_LEFT_ARROW, CTRL_RIGHT_ARROW, HISTORY_FILE,
+        LEFT_ARROW, RIGHT_ARROW, SHOULD_NOT_REDRAW_PROMPT,
     },
 };
 
@@ -80,7 +80,6 @@ impl<P: Prompt> Readline<P> {
 
         let mut stdin = io::stdin();
         let mut stdout = io::stdout();
-        let mut arrow_buffer = [0u8; 2];
         let mut ctrl_arrow_buffer = [0u8; 2];
 
         let mut curr_autocomplete_options: Vec<String> = vec![];
@@ -130,8 +129,9 @@ impl<P: Prompt> Readline<P> {
                                 self.handle_backspace(&mut stdout).await?;
                             },
                             ARROW_ANCHOR => {
-                                self.handle_arrows(&mut stdout, &mut stdin, &mut arrow_buffer).await?;
+                                self.handle_escape_sequence(&mut stdout, &mut stdin).await?;
                             },
+                            // [TODO] fix ; as single byte
                             b';' => {
                                 if stdin.read_exact(&mut ctrl_arrow_buffer).await.is_ok() {
                                     match ctrl_arrow_buffer {
@@ -284,6 +284,7 @@ impl<P: Prompt> Readline<P> {
             self.input_cursor = 0;
         }
         sink.write_all(&temp_buf).await?;
+        sink.flush().await?;
         Ok(())
     }
 
@@ -306,12 +307,14 @@ impl<P: Prompt> Readline<P> {
             self.input_cursor = self.input.len();
         }
         sink.write_all(&temp_buf).await?;
+        sink.flush().await?;
         Ok(())
     }
 
     async fn handle_right_arrow<S: AsyncWrite + Unpin>(&mut self, s: &mut S) -> io::Result<()> {
         s.write_all(&[ARROW_ANCHOR, RIGHT_ARROW[0], RIGHT_ARROW[1]])
             .await?;
+        s.flush().await?;
         self.input_cursor += 1;
 
         Ok(())
@@ -320,6 +323,7 @@ impl<P: Prompt> Readline<P> {
     async fn handle_left_arrow<S: AsyncWrite + Unpin>(&mut self, s: &mut S) -> io::Result<()> {
         s.write_all(&[ARROW_ANCHOR, LEFT_ARROW[0], LEFT_ARROW[1]])
             .await?;
+        s.flush().await?;
         self.input_cursor -= 1;
 
         Ok(())
@@ -362,9 +366,9 @@ impl<P: Prompt> Readline<P> {
                     MoveLeft((self.input.len() - self.input_cursor) as u16)
                 )?;
                 s.write_all(&temp_buf).await?;
-                s.flush().await?;
             }
         }
+        s.flush().await?;
 
         Ok(())
     }
@@ -400,32 +404,42 @@ impl<P: Prompt> Readline<P> {
         Ok(())
     }
 
-    async fn handle_arrows<S: AsyncWrite + Unpin, I: AsyncRead + Unpin>(
+    async fn handle_escape_sequence<S: AsyncWrite + Unpin, I: AsyncRead + Unpin>(
         &mut self,
         s: &mut S,
         i: &mut I,
-        arrow_buffer: &mut [u8; 2],
     ) -> io::Result<()> {
-        if i.read_exact(arrow_buffer.as_mut_slice()).await.is_ok() {
-            match *arrow_buffer {
-                UP_ARROW => {
-                    self.handle_history_change(HistoryDirection::Up, s).await?;
+        let mut buf = [0u8; 1];
+        if i.read_exact(&mut buf).await.is_err() {
+            return Ok(());
+        }
+
+        match buf[0] {
+            b'[' => {
+                let mut arrow_code = [0u8; 1];
+                if i.read_exact(&mut arrow_code).await.is_ok() {
+                    match arrow_code[0] {
+                        b'A' => self.handle_history_change(HistoryDirection::Up, s).await?,
+                        b'B' => {
+                            self.handle_history_change(HistoryDirection::Down, s)
+                                .await?
+                        }
+                        b'C' => self.handle_right_arrow(s).await?,
+                        b'D' => self.handle_left_arrow(s).await?,
+                        _ => {}
+                    }
                 }
-                DOWN_ARROW => {
-                    self.handle_history_change(HistoryDirection::Down, s)
-                        .await?;
-                }
-                RIGHT_ARROW if self.input_cursor < self.input.len() => {
-                    self.handle_right_arrow(s).await?;
-                }
-                LEFT_ARROW if self.input_cursor != 0 => {
-                    self.handle_left_arrow(s).await?;
-                }
-                // TODO: check the rest, mb this is the place where we should handle deleting of
-                // word
-                _ => {}
+            }
+            0x7f | 0x08 => {
+                self.handle_alt_backspace(s).await?;
+            }
+            _other => {
+                // Option/Alt + char (Meta key)
+                // let c = other as char;
+                // self.handle_alt_char(c, s).await?;
             }
         }
+
         Ok(())
     }
 
@@ -441,6 +455,43 @@ impl<P: Prompt> Readline<P> {
             sink.write_all(format!("{}\r\n", history).as_bytes())
                 .await?;
         }
+        Ok(())
+    }
+
+    async fn handle_alt_backspace<S: AsyncWrite + Unpin>(
+        &mut self,
+        sink: &mut S,
+    ) -> io::Result<()> {
+        if let Some(prev_space) = self
+            .input
+            .get(..self.input_cursor - 1)
+            .and_then(|i| i.iter().rposition(|c| *c == b' '))
+        {
+            let mut temp_buf = vec![];
+            execute!(temp_buf, Clear(ClearType::CurrentLine))?;
+            sink.write_all(&temp_buf).await?;
+            sink.write_all(b"\r").await?;
+            if let Some(prompt) = &self.prompt {
+                prompt.draw(&mut *sink).await?;
+            }
+            let deleted = self.input.drain(prev_space + 1..self.input_cursor).len();
+            self.input_cursor -= deleted;
+            sink.write_all(&self.input).await?;
+            if self.input_cursor != self.input.len() {
+                temp_buf.clear();
+                execute!(temp_buf, MoveLeft(deleted as u16))?;
+                sink.write_all(&temp_buf).await?;
+            }
+        } else if self.input_cursor != 0 {
+            let prev_input_cursor = self.input_cursor;
+            self.input_cursor = 0;
+            self.input.clear();
+            sink.write_all(&b"\x08 \x08".repeat(prev_input_cursor))
+                .await?;
+        }
+
+        // self.input = self.input[..self.input_cursor].to_vec();
+        sink.flush().await?;
         Ok(())
     }
 }

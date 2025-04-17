@@ -42,6 +42,7 @@ pub struct Shell {
     path: String,
     path_executables: Vec<DirEntry>,
     last_status: Option<ExitStatus>,
+    pub autocomplete_options: Trie,
 }
 
 impl Shell {
@@ -50,11 +51,11 @@ impl Shell {
         set_color_envs();
         let path_executables = Self::populate_path_executables(&path).await;
 
-        let mut dictionary = Trie::new();
-        dictionary.extend(BUILTINS);
+        let mut autocomplete_options = Trie::new();
+        autocomplete_options.extend(BUILTINS);
         for path in &path_executables {
             if let Some(p) = path.file_name().to_str() {
-                dictionary.insert(p);
+                autocomplete_options.insert(p);
             }
         }
 
@@ -62,6 +63,7 @@ impl Shell {
             path,
             path_executables,
             last_status: None,
+            autocomplete_options,
         }
     }
 
@@ -69,6 +71,7 @@ impl Shell {
         let mut stderr = io::stderr();
 
         let mut readline = Readline::new_with_prompt(DirPrompt).await;
+        readline.autocomplete_options = self.autocomplete_options.clone();
         loop {
             let mut input = String::new();
             if readline.read(&mut input).await? == Signal::CtrlD {
@@ -178,7 +181,7 @@ impl Shell {
         S: AsRef<OsStr>,
     {
         Box::pin(async move {
-            let canonicalized_name = self
+            let canonical_name = self
                 .canonicalize_path(
                     name.to_str()
                         .ok_or(io::Error::other("Can not convert name to string"))?,
@@ -209,7 +212,7 @@ impl Shell {
             } else {
                 Stdio::inherit()
             };
-            let mut child = SysCommand::new(canonicalized_name)
+            let mut child = SysCommand::new(canonical_name)
                 .args(input)
                 .stdin(stdin)
                 .stdout(stdout)

@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 
-use crate::{readline::constants::REDIRECTS, Shell};
+use crate::{parse_prompt, readline::constants::REDIRECTS, Shell};
 use thiserror::Error;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -50,9 +50,9 @@ pub enum CommandError {
 
 impl Command {
     pub async fn parse(input: &str, shell: &Shell) -> Result<Command, CommandError> {
-        let args = Shell::parse_prompt(input);
-        let subcommand_strs = args.split(|a| a == "|");
+        let args = parse_prompt(input);
 
+        let subcommand_strs = args.split(|a| a == "|");
         let mut commands = vec![];
 
         for subcommand_str in subcommand_strs {

@@ -25,3 +25,5 @@ pub const SHOULD_NOT_REDRAW_PROMPT: &[u8] = &[BACKSPACE, ARROW_ANCHOR];
 pub const BUILTINS: &[&str] = &["cd", "exit", "echo", "type", "pwd", "history"];
 
 pub const HISTORY_FILE: &str = "shell_history";
+
+pub const GLOB: &[char] = &['*', '?', '[', ']', '{', '}'];

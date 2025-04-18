@@ -204,6 +204,7 @@ impl<P: Prompt> Readline<P> {
             prompt.draw(&mut *sink).await?;
         }
         sink.write_all(command.as_bytes()).await?;
+        sink.flush().await?;
 
         Ok(())
     }

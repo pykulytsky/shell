@@ -31,13 +31,29 @@ use signal::Signal;
 
 #[derive(Debug)]
 pub struct Readline<P> {
+    /// Instance of trait [`Prompt`], contains method [`Prompt::draw`] which is used in couple of
+    /// places to redraw prompt as needed.
     pub prompt: Option<P>,
+
+    /// Internal buffer for storing intermidiate input of user.
     buffer: Vec<u8>,
+
+    /// Field to store current state of the cursor
     input_cursor: usize,
+
+    /// Stores shell history, at runtime is populated automatically as needed. When [`Readline`] is
+    /// instansiated history is constructed from file.
     pub history: VecDeque<String>,
+
+    /// Field to store index of current active history item
     history_cursor: Option<usize>,
+
+    /// Custom trie implementation to handle populating and suggesting autocomplete options.
     pub autocomplete_options: Trie,
+
     curr_autocomplete_options: Vec<String>,
+
+    /// Field to store index of currently selected autocomplete option.
     autocomplete_cursor: isize,
     pub last_pressed: Option<u8>,
     ctrl_arrow_buffer: [u8; 2],
@@ -104,61 +120,61 @@ impl<P: Prompt> Readline<P> {
             }
 
             select! {
-                n = self.stdin.read_u8() => {
-                    if let Ok(byte) = n {
-                        self.last_pressed = Some(byte);
-                        match byte {
-                            b'\r' | b'\n' => {
-                                self.history_cursor = None;
-                                self.stdout.write_all(b"\r\n").await?;
-                                self.stdout.flush().await?;
+                Ok(byte) = self.stdin.read_u8() => {
+                    self.last_pressed = Some(byte);
+                    match byte {
+                        b'\r' | b'\n' => {
+                            self.history_cursor = None;
+                            self.stdout.write_all(b"\r\n").await?;
+                            self.stdout.flush().await?;
 
-                                if !self.buffer.is_empty() {
-                                    let p = &self.buffer.clone();
-                                    let command_str = String::from_utf8_lossy(p);
-                                    if self.history_cursor.is_none() {
-                                        self.history.push_front(command_str.to_string());
-                                    }
-                                    *input = command_str.to_string();
+                            if !self.buffer.is_empty() {
+                                 let p = &self.buffer.clone();
+                                 let command_str = String::from_utf8_lossy(p);
+                                 if self.history_cursor.is_none() {
+                                     self.history.push_front(command_str.to_string());
                                 }
-                                self.buffer.clear();
-                                self.input_cursor = 0;
-                                break;
-                            },
-                            CTRL_C => {
-                                self.handle_ctrl_c().await?;
-                            },
-                            CTRL_D => {
-                                self.handle_ctrl_d();
-                                signal = Signal::CtrlD;
-                                break;
-                            },
-                            BACKSPACE => {
-                                self.handle_backspace().await?;
-                            },
-                            ARROW_ANCHOR => {
-                                self.handle_escape_sequence().await?;
-                            },
-                            // [TODO] fix ; as single byte
-                            b';' => {
-                                if self.stdin.read_exact(&mut self.ctrl_arrow_buffer).await.is_ok() {
-                                    match self.ctrl_arrow_buffer {
-                                        CTRL_LEFT_ARROW if self.input_cursor != 0 => {
-                                            self.move_cursor_word_left().await?;
-                                        }
-                                        CTRL_RIGHT_ARROW if self.input_cursor < self.buffer.len() => {
-                                            self.move_cursor_word_right().await?;
-                                        }
-                                        _ => { }
+                                *input = command_str.to_string();
+                            }
+                            self.buffer.clear();
+                            self.input_cursor = 0;
+                            break;
+                        },
+                        CTRL_C => {
+                            self.handle_ctrl_c().await?;
+                        },
+                        CTRL_D => {
+                            self.handle_ctrl_d();
+                            signal = Signal::CtrlD;
+                            break;
+                        },
+                        BACKSPACE => {
+                            self.handle_backspace().await?;
+                        },
+                        ARROW_ANCHOR => {
+                            self.handle_escape_sequence().await?;
+                        },
+                        // [TODO] fix ; as single byte
+                        b';' => {
+                            if self.stdin.read_exact(&mut self.ctrl_arrow_buffer).await.is_ok() {
+                                match self.ctrl_arrow_buffer {
+                                    CTRL_LEFT_ARROW if self.input_cursor != 0 => {
+                                        self.move_cursor_word_left().await?;
                                     }
+                                    CTRL_RIGHT_ARROW if self.input_cursor < self.buffer.len() => {
+                                        self.move_cursor_word_right().await?;
+                                    }
+                                    _ => { }
                                 }
-                            }
-                            b'\t' => {
-                                self.handle_autocomplete().await?;
-                            }
-                            _ => {
+                            } else {
                                 self.handle_char(byte).await?;
                             }
+                        }
+                        b'\t' => {
+                            self.handle_autocomplete().await?;
+                        }
+                        _ => {
+                            self.handle_char(byte).await?;
                         }
                     }
                 },
@@ -453,9 +469,8 @@ impl<P: Prompt> Readline<P> {
         self.stdout.flush().await?;
         self.input_cursor += 1;
         self.history_cursor = None;
-        // [TODO]
-        // autocomplete_cursor = 0;
-        // curr_autocomplete_options.clear();
+        self.autocomplete_cursor = 0;
+        self.curr_autocomplete_options.clear();
 
         Ok(())
     }
@@ -505,6 +520,10 @@ impl<P: Prompt> Readline<P> {
     }
 
     async fn delete_word(&mut self) -> io::Result<()> {
+        if self.input_cursor == 0 {
+            return Ok(());
+        };
+
         let prev_space = self
             .buffer
             .get(..self.input_cursor - 1)

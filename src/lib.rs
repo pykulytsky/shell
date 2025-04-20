@@ -256,7 +256,7 @@ impl Shell {
 
     async fn dump_history<S: AsyncWrite + Unpin>(&mut self, _sink: &mut S) -> io::Result<()> {
         // [TODO] update this function with regards to the fact that history is now handled by
-        // `Readline`
+        // [`Readline`]
         // if let Some(history) = self.history.iter_mut().reduce(|acc, next| {
         //     acc.push_str("\r\n");
         //     acc.push_str(next);

@@ -5,7 +5,7 @@ use command::{Command, CommandKind, Sink};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use glob::glob;
 use prompt::DirPrompt;
-use readline::constants::{BUILTINS, DOUBLE_QUOTES_ESCAPE, GLOB, HISTORY_FILE};
+use readline::constants::{BUILTINS, DOUBLE_QUOTES_ESCAPE, GLOB};
 use readline::signal::Signal;
 use readline::Readline;
 use std::ffi::{OsStr, OsString};
@@ -87,9 +87,6 @@ impl Shell {
             }
         }
 
-        let mut history_file = open_file_async(HISTORY_FILE, true).await?;
-        readline.dump_history(&mut history_file).await?;
-
         Ok(())
     }
 
@@ -97,7 +94,7 @@ impl Shell {
         self.path_executables.iter().find(|e| {
             e.path()
                 .components()
-                .last()
+                .next_back()
                 .and_then(|p| p.as_os_str().to_str())
                 == Some(name)
         })

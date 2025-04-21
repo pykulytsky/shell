@@ -4,20 +4,20 @@ use crate::{parse_prompt, readline::constants::REDIRECTS, Shell};
 use thiserror::Error;
 
 #[derive(Debug, PartialEq, Clone, Copy)]
-pub enum Sink {
+pub enum SinkKind {
     Stdout,
     Stderr,
     StdoutAppend,
     StderrAppend,
 }
 
-impl Sink {
+impl SinkKind {
     pub fn is_append(&self) -> bool {
         match self {
-            Sink::Stdout => false,
-            Sink::Stderr => false,
-            Sink::StdoutAppend => true,
-            Sink::StderrAppend => true,
+            SinkKind::Stdout => false,
+            SinkKind::Stderr => false,
+            SinkKind::StdoutAppend => true,
+            SinkKind::StderrAppend => true,
         }
     }
 }
@@ -35,7 +35,7 @@ pub struct Command {
     pub kind: CommandKind,
     pub stdout_redirect: Option<String>,
     pub stderr_redirect: Option<String>,
-    pub sink: Option<Sink>,
+    pub sink: Option<SinkKind>,
     pub pipe_to: Option<Box<Command>>,
 }
 
@@ -76,10 +76,10 @@ impl Command {
         let redirect_pos = args.iter().position(|a| REDIRECTS.contains(&a.as_str()));
         let redirect_to = redirect_pos.map(|pos| args[pos + 1].clone());
         let sink = redirect_pos.map(|pos| match args[pos].as_str() {
-            ">" | "1>" => Sink::Stdout,
-            ">>" | "1>>" => Sink::StdoutAppend,
-            "2>" => Sink::Stderr,
-            "2>>" => Sink::StderrAppend,
+            ">" | "1>" => SinkKind::Stdout,
+            ">>" | "1>>" => SinkKind::StdoutAppend,
+            "2>" => SinkKind::Stderr,
+            "2>>" => SinkKind::StderrAppend,
             _ => todo!(),
         });
 
@@ -120,14 +120,14 @@ impl Command {
         };
 
         match (redirect_to, sink) {
-            (Some(to), Some(Sink::Stdout | Sink::StdoutAppend)) => Ok(Command {
+            (Some(to), Some(SinkKind::Stdout | SinkKind::StdoutAppend)) => Ok(Command {
                 kind,
                 stdout_redirect: Some(to),
                 stderr_redirect: None,
                 sink,
                 pipe_to: None,
             }),
-            (Some(to), Some(Sink::Stderr | Sink::StderrAppend)) => Ok(Command {
+            (Some(to), Some(SinkKind::Stderr | SinkKind::StderrAppend)) => Ok(Command {
                 kind,
                 stdout_redirect: None,
                 stderr_redirect: Some(to),

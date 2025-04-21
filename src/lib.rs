@@ -1,7 +1,7 @@
 #![allow(clippy::nonminimal_bool)]
 
 use autocomplete::Trie;
-use command::{Command, CommandKind, Sink};
+use command::{Command, CommandKind, SinkKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use glob::glob;
 use prompt::DirPrompt;
@@ -190,14 +190,16 @@ impl Shell {
                 command
                     .stdout_redirect
                     .and_then(|stdout| {
-                        open_file(stdout, command.sink == Some(Sink::StdoutAppend)).ok()
+                        open_file(stdout, command.sink == Some(SinkKind::StdoutAppend)).ok()
                     })
                     .map(Stdio::from)
                     .unwrap_or(Stdio::inherit())
             };
             let stderr = command
                 .stderr_redirect
-                .and_then(|stderr| open_file(stderr, command.sink == Some(Sink::StderrAppend)).ok())
+                .and_then(|stderr| {
+                    open_file(stderr, command.sink == Some(SinkKind::StderrAppend)).ok()
+                })
                 .map(Stdio::from)
                 .unwrap_or(Stdio::inherit());
 

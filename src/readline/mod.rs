@@ -27,9 +27,11 @@ use tokio::{
     select,
     time::timeout,
 };
+use vim::VimMode;
 
 pub mod constants;
 pub mod signal;
+pub mod vim;
 
 use signal::Signal;
 
@@ -61,6 +63,10 @@ pub struct Readline<P> {
     autocomplete_cursor: isize,
     pub last_pressed: Option<u8>,
     ctrl_arrow_buffer: [u8; 2],
+
+    vim_mode_enabled: bool,
+    vim_mode: VimMode,
+
     stdin: Stdin,
     stdout: Stdout,
 }
@@ -84,6 +90,8 @@ impl Readline<DefaultPrompt> {
             ctrl_arrow_buffer: [0u8; 2],
             stdin: io::stdin(),
             stdout: io::stdout(),
+            vim_mode_enabled: true,
+            vim_mode: VimMode::Insert,
         }
     }
 }
@@ -107,12 +115,14 @@ impl<P: Prompt> Readline<P> {
             ctrl_arrow_buffer: [0u8; 2],
             stdin: io::stdin(),
             stdout: io::stdout(),
+            vim_mode_enabled: true,
+            vim_mode: VimMode::Insert,
         }
     }
 
     pub async fn read(&mut self, input: &mut String) -> io::Result<Signal> {
         enable_raw_mode()?;
-        let mut signal = Signal::Success;
+        let signal;
 
         loop {
             if let Some(prompt) = &self.prompt {
@@ -123,48 +133,59 @@ impl<P: Prompt> Readline<P> {
                 }
             }
 
-            select! {
-                Ok(byte) = self.stdin.read_u8() => {
-                    self.last_pressed = Some(byte);
-                    match byte {
-                        RETURN | NEWLINE => {
-                            self.handle_newline(input).await?;
-                            break;
-                        },
-                        CTRL_C => {
-                            self.handle_ctrl_c().await?;
-                        },
-                        CTRL_D => {
-                            self.handle_ctrl_d();
-                            signal = Signal::CtrlD;
-                            break;
-                        },
-                        BACKSPACE => {
-                            self.handle_backspace().await?;
-                        },
-                        ESC => {
-                            self.handle_escape_sequence().await?;
-                        },
-                        OPTION_KEY => {
-                            self.handle_option_key(byte).await?;
-                        }
-                        TAB => {
-                            self.handle_autocomplete().await?;
-                        }
-                        _ => {
-                            self.handle_char(byte).await?;
-                        }
-                    }
-                },
-                _ = tokio::signal::ctrl_c() => {
-                    self.stdout.write_all(b"\r\n").await?;
-                    self.stdout.flush().await?;
+            match self.handle_input_event(input).await? {
+                Some(s) => {
+                    signal = s;
+                    break;
                 }
+                None => continue,
             }
         }
         disable_raw_mode()?;
 
         Ok(signal)
+    }
+
+    async fn handle_input_event(&mut self, input: &mut String) -> io::Result<Option<Signal>> {
+        select! {
+            Ok(byte) = self.stdin.read_u8() => {
+                self.last_pressed = Some(byte);
+                match byte {
+                    RETURN | NEWLINE => {
+                        self.handle_newline(input).await?;
+                        return Ok(Some(Signal::Success));
+                    },
+                    CTRL_C => {
+                        self.handle_ctrl_c().await?;
+                    },
+                    CTRL_D => {
+                        self.handle_ctrl_d();
+                        return Ok(Some(Signal::CtrlD));
+                    },
+                    BACKSPACE => {
+                        self.handle_backspace().await?;
+                    },
+                    ESC => {
+                        self.handle_escape_sequence().await?;
+                    },
+                    OPTION_KEY => {
+                        self.handle_option_key(byte).await?;
+                    }
+                    TAB => {
+                        self.handle_autocomplete().await?;
+                    }
+                    _ => {
+                        self.handle_char(byte).await?;
+                    }
+                }
+            },
+            _ = tokio::signal::ctrl_c() => {
+                self.stdout.write_all(b"\r\n").await?;
+                self.stdout.flush().await?;
+            }
+        }
+
+        Ok(None)
     }
 
     async fn handle_newline(&mut self, input: &mut String) -> io::Result<()> {

@@ -72,6 +72,7 @@ impl Shell {
         let mut stderr = io::stderr();
 
         let mut readline = Readline::new_with_prompt(DirPrompt).await;
+        readline.vim_mode_enabled =true;
         readline.autocomplete_options = self.autocomplete_options.clone();
         loop {
             let mut input = String::new();

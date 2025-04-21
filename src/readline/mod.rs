@@ -27,7 +27,10 @@ use tokio::{
     select,
     time::timeout,
 };
-use vim::VimMode;
+use vim::{
+    VimMode, NEXT_WORD, PREV_WORD, VIM_ENTER_INSERT_LINE_END, VIM_ENTER_INSERT_LINE_START,
+    VIM_ENTER_INSERT_MODE_STROKES, VIM_ENTER_INSERT_NEXT_CHAR,
+};
 
 pub mod constants;
 pub mod signal;
@@ -64,7 +67,7 @@ pub struct Readline<P> {
     pub last_pressed: Option<u8>,
     ctrl_arrow_buffer: [u8; 2],
 
-    vim_mode_enabled: bool,
+    pub vim_mode_enabled: bool,
     vim_mode: VimMode,
 
     stdin: Stdin,
@@ -255,10 +258,10 @@ impl<P: Prompt> Readline<P> {
         .await;
         if read_result.is_ok() {
             match self.ctrl_arrow_buffer {
-                CTRL_LEFT_ARROW if self.input_cursor != 0 => {
+                CTRL_LEFT_ARROW => {
                     self.move_cursor_word_left().await?;
                 }
-                CTRL_RIGHT_ARROW if self.input_cursor < self.buffer.len() => {
+                CTRL_RIGHT_ARROW => {
                     self.move_cursor_word_right().await?;
                 }
                 _ => {}
@@ -324,6 +327,9 @@ impl<P: Prompt> Readline<P> {
     }
 
     async fn move_cursor_word_left(&mut self) -> io::Result<()> {
+        if self.input_cursor == 0 {
+            return Ok(());
+        }
         let mut temp_buf = vec![];
         if let Some(pos) = self.buffer[..self.input_cursor - 1]
             .iter()
@@ -344,6 +350,10 @@ impl<P: Prompt> Readline<P> {
     }
 
     async fn move_cursor_word_right(&mut self) -> io::Result<()> {
+        if self.input_cursor >= self.buffer.len() {
+            return Ok(());
+        }
+
         let mut temp_buf = vec![];
         if let Some(pos) = self.buffer[self.input_cursor + 1..]
             .iter()
@@ -427,7 +437,39 @@ impl<P: Prompt> Readline<P> {
         Ok(())
     }
 
+    async fn handle_char_vim_normal_mode(&mut self, byte: u8) -> io::Result<()> {
+        match byte {
+            b if VIM_ENTER_INSERT_MODE_STROKES.contains(&b) => {
+                self.vim_mode = VimMode::Insert;
+                match b {
+                    VIM_ENTER_INSERT_NEXT_CHAR => {
+                        self.handle_right_arrow().await?;
+                    }
+                    VIM_ENTER_INSERT_LINE_END => {
+                        self.move_cursor_to_line_end().await?;
+                    }
+                    VIM_ENTER_INSERT_LINE_START => {
+                        self.move_cursor_to_line_start().await?;
+                    }
+                    _ => {}
+                }
+            }
+            NEXT_WORD => {
+                self.move_cursor_word_right().await?;
+            }
+            PREV_WORD => {
+                self.move_cursor_word_left().await?;
+            }
+            _ => todo!(),
+        }
+        Ok(())
+    }
+
     async fn handle_char(&mut self, byte: u8) -> io::Result<()> {
+        if self.vim_mode_enabled && self.vim_mode == VimMode::Normal {
+            return self.handle_char_vim_normal_mode(byte).await;
+        }
+
         if !self.buffer.is_empty() && self.input_cursor != self.buffer.len() {
             self.buffer.insert(self.input_cursor, byte);
             let mut temp_buf = vec![];
@@ -490,7 +532,11 @@ impl<P: Prompt> Readline<P> {
                 }
             },
             Err(_) => {
-                // ESC
+                // single ESC
+                if self.vim_mode_enabled && self.vim_mode == VimMode::Insert {
+                    self.vim_mode = VimMode::Normal;
+                    self.handle_left_arrow().await?;
+                }
             }
             Ok(Err(_)) => {}
         }
@@ -539,6 +585,27 @@ impl<P: Prompt> Readline<P> {
             )?;
             self.stdout.write_all(&temp_buf).await?;
         }
+        self.stdout.flush().await?;
+        Ok(())
+    }
+
+    async fn move_cursor_to_line_end(&mut self) -> io::Result<()> {
+        let mut temp_buf = vec![];
+        execute!(
+            temp_buf,
+            MoveRight((self.buffer.len() - self.input_cursor) as u16)
+        )?;
+        self.stdout.write_all(&temp_buf).await?;
+        self.input_cursor = self.buffer.len();
+        self.stdout.flush().await?;
+        Ok(())
+    }
+
+    async fn move_cursor_to_line_start(&mut self) -> io::Result<()> {
+        let mut temp_buf = vec![];
+        execute!(temp_buf, MoveLeft(self.input_cursor as u16))?;
+        self.stdout.write_all(&temp_buf).await?;
+        self.input_cursor = 0;
         self.stdout.flush().await?;
         Ok(())
     }

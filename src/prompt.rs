@@ -15,8 +15,7 @@ pub struct DefaultPrompt;
 
 impl Prompt for DefaultPrompt {
     async fn draw<S: AsyncWrite + Unpin>(&self, mut sink: S) -> io::Result<()> {
-        sink.write_u8(b'$').await?;
-        sink.write_u8(b' ').await?;
+        sink.write_all(b" $ ").await?;
 
         sink.flush().await?;
 
@@ -35,7 +34,7 @@ impl Prompt for DirPrompt {
             .unwrap_or_else(|| current_dir.as_os_str())
             .to_string_lossy();
 
-        sink.write_all(b"\x1b[1;32m").await?;
+        sink.write_all(b" \x1b[1;32m").await?;
         sink.write_all(dir_name.as_bytes()).await?;
         sink.write_all(b"\x1b[0m").await?;
         sink.write_u8(b' ').await?;

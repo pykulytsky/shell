@@ -2,7 +2,7 @@ use crate::{
     autocomplete::Trie,
     prompt::{DefaultPrompt, Prompt},
     readline::constants::{
-        ARROW_ANCHOR, BACKSPACE, CTRL_C, CTRL_D, CTRL_LEFT_ARROW, CTRL_RIGHT_ARROW, HISTORY_FILE,
+        BACKSPACE, CTRL_C, CTRL_D, CTRL_LEFT_ARROW, CTRL_RIGHT_ARROW, ESC, HISTORY_FILE,
         LEFT_ARROW, RIGHT_ARROW, SHOULD_NOT_REDRAW_PROMPT,
     },
 };
@@ -13,15 +13,19 @@ pub enum HistoryDirection {
     Down,
 }
 
+use constants::{
+    DECSM, DOWN_ARROW, KEY_TIMEOUT_DURATION, NEWLINE, OPTION_KEY, RETURN, TAB, UP_ARROW,
+};
 use crossterm::{
     cursor::{MoveLeft, MoveRight},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
 };
-use std::collections::VecDeque;
+use std::{collections::VecDeque, time::Duration};
 use tokio::{
     io::{self, AsyncReadExt, AsyncWrite, AsyncWriteExt, Stdin, Stdout},
     select,
+    time::timeout,
 };
 
 pub mod constants;
@@ -123,21 +127,8 @@ impl<P: Prompt> Readline<P> {
                 Ok(byte) = self.stdin.read_u8() => {
                     self.last_pressed = Some(byte);
                     match byte {
-                        b'\r' | b'\n' => {
-                            self.history_cursor = None;
-                            self.stdout.write_all(b"\r\n").await?;
-                            self.stdout.flush().await?;
-
-                            if !self.buffer.is_empty() {
-                                 let p = &self.buffer.clone();
-                                 let command_str = String::from_utf8_lossy(p);
-                                 if self.history_cursor.is_none() {
-                                     self.history.push_front(command_str.to_string());
-                                }
-                                *input = command_str.to_string();
-                            }
-                            self.buffer.clear();
-                            self.input_cursor = 0;
+                        RETURN | NEWLINE => {
+                            self.handle_newline(input).await?;
                             break;
                         },
                         CTRL_C => {
@@ -151,26 +142,13 @@ impl<P: Prompt> Readline<P> {
                         BACKSPACE => {
                             self.handle_backspace().await?;
                         },
-                        ARROW_ANCHOR => {
+                        ESC => {
                             self.handle_escape_sequence().await?;
                         },
-                        // [TODO] fix ; as single byte
-                        b';' => {
-                            if self.stdin.read_exact(&mut self.ctrl_arrow_buffer).await.is_ok() {
-                                match self.ctrl_arrow_buffer {
-                                    CTRL_LEFT_ARROW if self.input_cursor != 0 => {
-                                        self.move_cursor_word_left().await?;
-                                    }
-                                    CTRL_RIGHT_ARROW if self.input_cursor < self.buffer.len() => {
-                                        self.move_cursor_word_right().await?;
-                                    }
-                                    _ => { }
-                                }
-                            } else {
-                                self.handle_char(byte).await?;
-                            }
+                        OPTION_KEY => {
+                            self.handle_option_key(byte).await?;
                         }
-                        b'\t' => {
+                        TAB => {
                             self.handle_autocomplete().await?;
                         }
                         _ => {
@@ -189,64 +167,24 @@ impl<P: Prompt> Readline<P> {
         Ok(signal)
     }
 
-    // async fn handle_input(&mut self, byte: u8, input: &mut String) -> io::Result<Signal> {
-    //     self.last_pressed = Some(byte);
-    //     match byte {
-    //         b'\r' | b'\n' => {
-    //             self.history_cursor = None;
-    //             // stdout.write_all(b"\r\n").await?;
-    //             // stdout.flush().await?;
-    //
-    //             if !self.buffer.is_empty() {
-    //                 let p = &self.buffer.clone();
-    //                 let command_str = String::from_utf8_lossy(p);
-    //                 if self.history_cursor.is_none() {
-    //                     self.history.push_front(command_str.to_string());
-    //                 }
-    //                 *input = command_str.to_string();
-    //             }
-    //             self.buffer.clear();
-    //             self.input_cursor = 0;
-    //             return Ok(Signal::Success);
-    //         }
-    //         CTRL_C => {
-    //             // self.handle_ctrl_c(&mut stdout).await?;
-    //         }
-    //         CTRL_D => {
-    //             self.handle_ctrl_d();
-    //             return Ok(Signal::CtrlD);
-    //             // break;
-    //         }
-    //         BACKSPACE => {
-    //             // self.handle_backspace(&mut stdout).await?;
-    //         }
-    //         ARROW_ANCHOR => {
-    //             // self.handle_escape_sequence(&mut stdout, &mut stdin).await?;
-    //         }
-    //         // [TODO] fix ; as single byte
-    //         b';' => {
-    //             // if stdin.read_exact(&mut self.ctrl_arrow_buffer).await.is_ok() {
-    //             //     match self.ctrl_arrow_buffer {
-    //             //         CTRL_LEFT_ARROW if self.input_cursor != 0 => {
-    //             //             self.move_cursor_word_left(&mut stdout).await?;
-    //             //         }
-    //             //         CTRL_RIGHT_ARROW if self.input_cursor < self.buffer.len() => {
-    //             //             self.move_cursor_word_right(&mut stdout).await?;
-    //             //         }
-    //             //         _ => {}
-    //             //     }
-    //             // }
-    //         }
-    //         b'\t' => {
-    //             // self.handle_autocomplete(&mut &mut stdout).await?;
-    //         }
-    //         _ => {
-    //             // self.handle_char(&mut stdout, byte).await?;
-    //         }
-    //     }
-    //
-    //     Ok(Signal::Success)
-    // }
+    async fn handle_newline(&mut self, input: &mut String) -> io::Result<()> {
+        self.history_cursor = None;
+        self.stdout.write_all(b"\r\n").await?;
+        self.stdout.flush().await?;
+
+        if !self.buffer.is_empty() {
+            let p = &self.buffer.clone();
+            let command_str = String::from_utf8_lossy(p);
+            if self.history_cursor.is_none() {
+                self.history.push_front(command_str.to_string());
+            }
+            *input = command_str.to_string();
+        }
+        self.buffer.clear();
+        self.input_cursor = 0;
+
+        Ok(())
+    }
 
     async fn handle_history_change(&mut self, to: HistoryDirection) -> io::Result<()> {
         let command: Option<&String> = match (to, &mut self.history_cursor) {
@@ -284,6 +222,29 @@ impl<P: Prompt> Readline<P> {
         }
         self.stdout.write_all(command.as_bytes()).await?;
         self.stdout.flush().await?;
+
+        Ok(())
+    }
+
+    async fn handle_option_key(&mut self, byte: u8) -> io::Result<()> {
+        let read_result = timeout(
+            Duration::from_millis(KEY_TIMEOUT_DURATION),
+            self.stdin.read_exact(&mut self.ctrl_arrow_buffer),
+        )
+        .await;
+        if read_result.is_ok() {
+            match self.ctrl_arrow_buffer {
+                CTRL_LEFT_ARROW if self.input_cursor != 0 => {
+                    self.move_cursor_word_left().await?;
+                }
+                CTRL_RIGHT_ARROW if self.input_cursor < self.buffer.len() => {
+                    self.move_cursor_word_right().await?;
+                }
+                _ => {}
+            }
+        } else {
+            self.handle_char(byte).await?;
+        }
 
         Ok(())
     }
@@ -382,21 +343,21 @@ impl<P: Prompt> Readline<P> {
     }
 
     async fn handle_right_arrow(&mut self) -> io::Result<()> {
-        self.stdout
-            .write_all(&[ARROW_ANCHOR, RIGHT_ARROW[0], RIGHT_ARROW[1]])
-            .await?;
-        self.stdout.flush().await?;
-        self.input_cursor += 1;
+        if self.input_cursor < self.buffer.len() {
+            self.stdout.write_all(&[ESC, 91, 67]).await?;
+            self.stdout.flush().await?;
+            self.input_cursor += 1;
+        }
 
         Ok(())
     }
 
     async fn handle_left_arrow(&mut self) -> io::Result<()> {
-        self.stdout
-            .write_all(&[ARROW_ANCHOR, LEFT_ARROW[0], LEFT_ARROW[1]])
-            .await?;
-        self.stdout.flush().await?;
-        self.input_cursor -= 1;
+        if self.input_cursor != 0 {
+            self.stdout.write_all(&[ESC, 91, 68]).await?;
+            self.stdout.flush().await?;
+            self.input_cursor -= 1;
+        }
 
         Ok(())
     }
@@ -477,31 +438,40 @@ impl<P: Prompt> Readline<P> {
 
     async fn handle_escape_sequence(&mut self) -> io::Result<()> {
         let mut buf = [0u8; 1];
-        if self.stdin.read_exact(&mut buf).await.is_err() {
-            return Ok(());
-        }
 
-        match buf[0] {
-            b'[' => {
-                let mut arrow_code = [0u8; 1];
-                if self.stdin.read_exact(&mut arrow_code).await.is_ok() {
-                    match arrow_code[0] {
-                        b'A' => self.handle_history_change(HistoryDirection::Up).await?,
-                        b'B' => self.handle_history_change(HistoryDirection::Down).await?,
-                        b'C' => self.handle_right_arrow().await?,
-                        b'D' => self.handle_left_arrow().await?,
-                        _ => {}
+        let read_result = timeout(
+            Duration::from_millis(KEY_TIMEOUT_DURATION),
+            self.stdin.read_exact(&mut buf),
+        )
+        .await;
+
+        match read_result {
+            Ok(Ok(_)) => match buf[0] {
+                DECSM => {
+                    let mut arrow_code = [0u8; 1];
+                    if self.stdin.read_exact(&mut arrow_code).await.is_ok() {
+                        match arrow_code[0] {
+                            UP_ARROW => self.handle_history_change(HistoryDirection::Up).await?,
+                            DOWN_ARROW => {
+                                self.handle_history_change(HistoryDirection::Down).await?
+                            }
+                            RIGHT_ARROW => self.handle_right_arrow().await?,
+                            LEFT_ARROW => self.handle_left_arrow().await?,
+                            _ => {}
+                        }
                     }
                 }
+                BACKSPACE | 0x08 => {
+                    self.delete_word().await?;
+                }
+                other => {
+                    unimplemented!("pressed {}", other);
+                }
+            },
+            Err(_) => {
+                // ESC
             }
-            0x7f | 0x08 => {
-                self.delete_word().await?;
-            }
-            _other => {
-                // Option/Alt + char (Meta key)
-                // let c = other as char;
-                // self.handle_alt_char(c, s).await?;
-            }
+            Ok(Err(_)) => {}
         }
 
         Ok(())

@@ -11,19 +11,25 @@ pub const CTRL_D: u8 = 4;
 pub const BACKSPACE: u8 = 127;
 pub const CTRL: u8 = 17;
 pub const ESC: u8 = 27;
+pub const OPTION_KEY: u8 = b';';
+pub const TAB: u8 = b'\t';
+pub const NEWLINE: u8 = b'\n';
+pub const RETURN: u8 = b'\r';
 
-pub const ARROW_ANCHOR: u8 = 27;
-pub const UP_ARROW: [u8; 2] = [91, 65];
-pub const DOWN_ARROW: [u8; 2] = [91, 66];
-pub const RIGHT_ARROW: [u8; 2] = [91, 67];
-pub const LEFT_ARROW: [u8; 2] = [91, 68];
+pub const UP_ARROW: u8 = b'A';
+pub const DOWN_ARROW: u8 = b'B';
+pub const RIGHT_ARROW: u8 = b'C';
+pub const LEFT_ARROW: u8 = b'D';
 pub const CTRL_LEFT_ARROW: [u8; 2] = [51, 68];
 pub const CTRL_RIGHT_ARROW: [u8; 2] = [51, 67];
+pub const DECSM: u8 = b'[';
 
-pub const SHOULD_NOT_REDRAW_PROMPT: &[u8] = &[BACKSPACE, ARROW_ANCHOR];
+pub const SHOULD_NOT_REDRAW_PROMPT: &[u8] = &[BACKSPACE, ESC];
 
 pub const BUILTINS: &[&str] = &["cd", "exit", "echo", "type", "pwd", "history"];
 
 pub const HISTORY_FILE: &str = "shell_history";
 
 pub const GLOB: &[char] = &['*', '?', '[', ']', '{', '}'];
+
+pub const KEY_TIMEOUT_DURATION: u64 = 10;

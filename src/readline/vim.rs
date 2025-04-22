@@ -1,3 +1,5 @@
+use tokio::io::{self, AsyncRead, AsyncReadExt};
+
 #[derive(Debug, PartialEq)]
 pub enum VimMode {
     Normal,
@@ -5,17 +7,152 @@ pub enum VimMode {
 }
 
 pub const VIM_ENTER_INSERT: u8 = b'i';
-pub const VIM_ENTER_INSERT_LINE_START: u8 = b'I';
-pub const VIM_ENTER_INSERT_NEXT_CHAR: u8 = b'a';
-pub const VIM_ENTER_INSERT_LINE_END: u8 = b'A';
+pub const ENTER_INSERT_LINE_START: u8 = b'I';
+pub const ENTER_INSERT_NEXT_CHAR: u8 = b'a';
+pub const ENTER_INSERT_LINE_END: u8 = b'A';
 
 pub const NEXT_WORD: u8 = b'w';
 pub const PREV_WORD: u8 = b'b';
 
 #[allow(clippy::byte_char_slices)]
+pub const VERBS: &[u8] = &[b'd', b'c', b'y'];
+
+#[allow(clippy::byte_char_slices)]
+pub const MODIFIERS: &[u8] = &[b'i', b'a'];
+
+#[allow(clippy::byte_char_slices)]
 pub const VIM_ENTER_INSERT_MODE_STROKES: &[u8] = &[
     VIM_ENTER_INSERT,
-    VIM_ENTER_INSERT_LINE_START,
-    VIM_ENTER_INSERT_NEXT_CHAR,
-    VIM_ENTER_INSERT_LINE_END,
+    ENTER_INSERT_LINE_START,
+    ENTER_INSERT_NEXT_CHAR,
+    ENTER_INSERT_LINE_END,
 ];
+
+pub const VERB_DELETE: u8 = b'd';
+pub const VERB_CHANGE: u8 = b'c';
+pub const VERB_YANK: u8 = b'y';
+
+#[derive(Debug, PartialEq)]
+pub enum VimVerb {
+    Change,
+    Delete,
+    /// yank (copy)
+    Yank,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Modifier {
+    /// When you press for example <2>dd to delete two lines in a row
+    Count(u16),
+    Inner,
+    Around,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum Motion {
+    Left,
+    Right,
+    Up,
+    Down,
+    LineStart,
+    LineEnd,
+    ToNextChar(char),
+    ToPrevChar(char),
+    BeforeNextChar(char),
+    BeforePrevChar(char),
+    NextWord,
+    PrevWord,
+    EndOfWord,
+    /// Represents text object witch is used in conjunction with `i` or `a` modifiers.
+    TextObject(char),
+}
+
+#[derive(Debug, PartialEq)]
+pub struct VimCommand {
+    pub verb: Option<VimVerb>,
+    pub modifier: Option<Modifier>,
+    pub motion: Motion,
+}
+
+impl VimCommand {
+    pub async fn read<S: AsyncRead + Unpin>(stdin: &mut S) -> io::Result<Option<Self>> {
+        let byte = stdin.read_u8().await?;
+
+        let verb = match byte {
+            VERB_DELETE => Some(VimVerb::Delete),
+            VERB_CHANGE => Some(VimVerb::Change),
+            VERB_YANK => Some(VimVerb::Yank),
+            _ => None,
+        };
+        let mut modifier = None;
+        let motion;
+        loop {
+            let byte = if verb.is_some() {
+                stdin.read_u8().await?
+            } else {
+                byte
+            };
+            if is_modifier(&byte) {
+                match byte {
+                    b'a' => modifier = Some(Modifier::Around),
+                    b'i' => modifier = Some(Modifier::Inner),
+                    b if b.is_ascii_digit() => {
+                        if let Some(Modifier::Count(ref mut modifier)) = modifier {
+                            *modifier = *modifier * 10 + b as u16;
+                        } else {
+                            modifier = Some(Modifier::Count(b as u16));
+                        }
+                    }
+                    _ => {}
+                }
+            } else {
+                // should be motion
+                use Motion::*;
+
+                motion = Some(match byte {
+                    b'h' => Left,
+                    b'l' => Right,
+                    b'k' => Up,
+                    b'j' => Down,
+                    b'0' => LineStart,
+                    b'$' => LineEnd,
+                    b'f' => {
+                        let byte = stdin.read_u8().await?;
+                        ToNextChar(byte as char)
+                    }
+                    b'F' => {
+                        let byte = stdin.read_u8().await?;
+                        ToPrevChar(byte as char)
+                    }
+                    b't' => {
+                        let byte = stdin.read_u8().await?;
+                        BeforeNextChar(byte as char)
+                    }
+                    b'T' => {
+                        let byte = stdin.read_u8().await?;
+                        BeforePrevChar(byte as char)
+                    }
+                    b'w' => NextWord,
+                    b'b' => PrevWord,
+                    b'e' => EndOfWord,
+                    b => TextObject(b as char),
+                });
+                break;
+            }
+        }
+
+        Ok(Some(VimCommand {
+            verb,
+            modifier,
+            motion: motion.unwrap(),
+        }))
+    }
+}
+
+pub fn is_verb(byte: &u8) -> bool {
+    VERBS.contains(byte)
+}
+
+pub fn is_modifier(byte: &u8) -> bool {
+    MODIFIERS.contains(byte) || byte.is_ascii_digit()
+}

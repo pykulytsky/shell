@@ -21,15 +21,15 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
 };
-use std::{collections::VecDeque, time::Duration};
+use std::collections::VecDeque;
 use tokio::{
     io::{self, AsyncReadExt, AsyncWrite, AsyncWriteExt, Stdin, Stdout},
     select,
     time::timeout,
 };
 use vim::{
-    VimMode, NEXT_WORD, PREV_WORD, VIM_ENTER_INSERT_LINE_END, VIM_ENTER_INSERT_LINE_START,
-    VIM_ENTER_INSERT_MODE_STROKES, VIM_ENTER_INSERT_NEXT_CHAR,
+    VimMode, ENTER_INSERT_LINE_END, ENTER_INSERT_LINE_START, ENTER_INSERT_NEXT_CHAR, NEXT_WORD,
+    PREV_WORD, VIM_ENTER_INSERT_MODE_STROKES,
 };
 
 pub mod constants;
@@ -252,7 +252,7 @@ impl<P: Prompt> Readline<P> {
 
     async fn handle_option_key(&mut self, byte: u8) -> io::Result<()> {
         let read_result = timeout(
-            Duration::from_millis(KEY_TIMEOUT_DURATION),
+            KEY_TIMEOUT_DURATION,
             self.stdin.read_exact(&mut self.ctrl_arrow_buffer),
         )
         .await;
@@ -438,29 +438,38 @@ impl<P: Prompt> Readline<P> {
     }
 
     async fn handle_char_vim_normal_mode(&mut self, byte: u8) -> io::Result<()> {
+        if VIM_ENTER_INSERT_MODE_STROKES.contains(&byte) {
+            self.vim_mode = VimMode::Insert;
+        }
+
         match byte {
-            b if VIM_ENTER_INSERT_MODE_STROKES.contains(&b) => {
-                self.vim_mode = VimMode::Insert;
-                match b {
-                    VIM_ENTER_INSERT_NEXT_CHAR => {
-                        self.handle_right_arrow().await?;
-                    }
-                    VIM_ENTER_INSERT_LINE_END => {
-                        self.move_cursor_to_line_end().await?;
-                    }
-                    VIM_ENTER_INSERT_LINE_START => {
-                        self.move_cursor_to_line_start().await?;
-                    }
-                    _ => {}
-                }
+            ENTER_INSERT_NEXT_CHAR | b'l' => {
+                self.handle_right_arrow().await?;
             }
-            NEXT_WORD => {
+            ENTER_INSERT_LINE_END | b'$' => {
+                self.move_cursor_to_line_end().await?;
+            }
+            ENTER_INSERT_LINE_START | b'0' => {
+                self.move_cursor_to_line_start().await?;
+            }
+            // TODO handle `e` independentally
+            NEXT_WORD | b'e' => {
                 self.move_cursor_word_right().await?;
             }
             PREV_WORD => {
                 self.move_cursor_word_left().await?;
             }
-            _ => todo!(),
+            b'h' => {
+                self.handle_left_arrow().await?;
+            }
+            b'k' => {
+                self.handle_history_change(HistoryDirection::Up).await?;
+            }
+            b'j' => {
+                self.handle_history_change(HistoryDirection::Up).await?;
+            }
+
+            _ => {}
         }
         Ok(())
     }
@@ -502,11 +511,7 @@ impl<P: Prompt> Readline<P> {
     async fn handle_escape_sequence(&mut self) -> io::Result<()> {
         let mut buf = [0u8; 1];
 
-        let read_result = timeout(
-            Duration::from_millis(KEY_TIMEOUT_DURATION),
-            self.stdin.read_exact(&mut buf),
-        )
-        .await;
+        let read_result = timeout(KEY_TIMEOUT_DURATION, self.stdin.read_exact(&mut buf)).await;
 
         match read_result {
             Ok(Ok(_)) => match buf[0] {

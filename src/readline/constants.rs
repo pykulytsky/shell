@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+use std::time::Duration;
+
 pub const DOUBLE_QUOTES_ESCAPE: &[char] = &['$', '\\', '"'];
 
 pub const REDIRECTS: &[&str] = &[">", "1>", "2>", ">>", "1>>", "2>>"];
@@ -32,4 +34,4 @@ pub const HISTORY_FILE: &str = "shell_history";
 
 pub const GLOB: &[char] = &['*', '?', '[', ']', '{', '}'];
 
-pub const KEY_TIMEOUT_DURATION: u64 = 10;
+pub const KEY_TIMEOUT_DURATION: Duration = Duration::from_millis(10);

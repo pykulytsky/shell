@@ -123,17 +123,20 @@ impl Shell {
     }
 
     pub async fn execute(&mut self, command: Command) -> io::Result<()> {
-        let mut out: Box<dyn AsyncWrite + Unpin> = match command.stdout_redirect {
-            Some(ref out) => Box::new(
-                open_file_async(out, command.sink.map(|s| s.is_append()).unwrap_or(false)).await?,
-            ),
-            None => Box::new(stdout()),
+        let mut out: &mut (dyn AsyncWrite + Unpin) = match command.stdout_redirect {
+            Some(ref out) => {
+                &mut open_file_async(out, command.sink.map(|s| s.is_append()).unwrap_or(false))
+                    .await?
+            }
+            None => &mut stdout(),
         };
-        let mut err: Box<dyn AsyncWrite + Unpin> = match command.stderr_redirect {
-            Some(ref err) => Box::new(
-                open_file_async(err, command.sink.map(|s| s.is_append()).unwrap_or(false)).await?,
-            ),
-            None => Box::new(stderr()),
+        let err: &mut (dyn AsyncWrite + Unpin) = match command.stderr_redirect {
+            Some(ref err) => {
+                &mut open_file_async(err, command.sink.map(|s| s.is_append()).unwrap_or(false))
+                    .await?
+            }
+
+            None => &mut stderr(),
         };
 
         match command.kind {

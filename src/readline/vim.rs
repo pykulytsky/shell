@@ -92,21 +92,21 @@ impl VimCommand {
             } else {
                 byte
             };
-            if is_modifier(&byte) {
+            if is_modifier(&byte, &verb) {
                 match byte {
                     b'a' => modifier = Some(Modifier::Around),
                     b'i' => modifier = Some(Modifier::Inner),
                     b if b.is_ascii_digit() => {
+                        // [TODO] fix this
                         if let Some(Modifier::Count(ref mut modifier)) = modifier {
-                            *modifier = *modifier * 10 + b as u16;
+                            *modifier = *modifier * 10 + b.to_string().parse::<u16>().unwrap();
                         } else {
-                            modifier = Some(Modifier::Count(b as u16));
+                            modifier = Some(Modifier::Count(b.to_string().parse().unwrap()));
                         }
                     }
                     _ => {}
                 }
             } else {
-                // should be motion
                 use Motion::*;
 
                 motion = Some(match byte {
@@ -141,6 +141,20 @@ impl VimCommand {
             }
         }
 
+        if (modifier == Some(Modifier::Around) || modifier == Some(Modifier::Inner))
+            && !matches!(
+                motion,
+                Some(Motion::TextObject('(' | ')' | '[' | ']' | '<' | '>'))
+            )
+        {
+            return Ok(None);
+        }
+
+        // Escape is pressed at any time, means we discard the motion.
+        if motion == Some(Motion::TextObject('\u{1b}')) {
+            return Ok(None);
+        }
+
         Ok(Some(VimCommand {
             verb,
             modifier,
@@ -153,6 +167,6 @@ pub fn is_verb(byte: &u8) -> bool {
     VERBS.contains(byte)
 }
 
-pub fn is_modifier(byte: &u8) -> bool {
-    MODIFIERS.contains(byte) || byte.is_ascii_digit()
+pub fn is_modifier(byte: &u8, verb: &Option<VimVerb>) -> bool {
+    (MODIFIERS.contains(byte) && verb.is_some()) || byte.is_ascii_digit()
 }

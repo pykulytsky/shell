@@ -26,7 +26,11 @@ use tokio::{
     io::{self, AsyncReadExt, AsyncWrite, AsyncWriteExt, Stdin, Stdout},
     time::timeout,
 };
-use vim::{Modifier, VimCommand, VimMode, VIM_ENTER_INSERT_MODE_STROKES};
+
+use vim::{
+    Modifier, VimCommand, VimMode, VimVerb, ENTER_INSERT_LINE_END, ENTER_INSERT_LINE_START,
+    ENTER_INSERT_NEXT_CHAR, VIM_DELIMITERS, VIM_ENTER_INSERT_MODE_STROKES,
+};
 
 pub mod constants;
 pub mod signal;
@@ -233,11 +237,26 @@ impl<P: Prompt> Readline<P> {
                     if VIM_ENTER_INSERT_MODE_STROKES.contains(&s) =>
                 {
                     self.vim_mode = VimMode::Insert;
+
+                    match s {
+                        ENTER_INSERT_NEXT_CHAR => {
+                            self.handle_right_arrow().await?;
+                        }
+                        ENTER_INSERT_LINE_END => {
+                            self.move_cursor_to_line_end().await?;
+                        }
+                        ENTER_INSERT_LINE_START => {
+                            self.move_cursor_to_line_start().await?;
+                        }
+                        _ => unreachable!(),
+                    }
                 }
                 (None, None, vim::Motion::TextObject(s))
                     if s == RETURN as char || s == NEWLINE as char =>
                 {
                     self.handle_newline(input).await?;
+                    self.vim_mode = VimMode::Insert;
+                    self.last_pressed = Some(b'\r');
                     return Ok(Some(Signal::Success));
                 }
                 (None, None, vim::Motion::TextObject(s)) if s == CTRL_D as char => {
@@ -246,6 +265,7 @@ impl<P: Prompt> Readline<P> {
                 }
                 (None, None, vim::Motion::TextObject(s)) if s == CTRL_C as char => {
                     self.handle_ctrl_c().await?;
+                    self.last_pressed = Some(CTRL_C);
                     return Ok(Some(Signal::CtrlC));
                 }
                 (None, None, vim::Motion::TextObject(_)) => {}
@@ -259,8 +279,12 @@ impl<P: Prompt> Readline<P> {
                 (Some(_), None, vim::Motion::ToPrevChar(_)) => todo!(),
                 (Some(_), None, vim::Motion::BeforeNextChar(_)) => todo!(),
                 (Some(_), None, vim::Motion::BeforePrevChar(_)) => todo!(),
-                (Some(_), None, vim::Motion::NextWord) => todo!(),
-                (Some(_), None, vim::Motion::PrevWord) => todo!(),
+                (Some(VimVerb::Delete | VimVerb::Change), None, vim::Motion::NextWord) => {
+                    self.delete_next_word().await?
+                }
+                (Some(VimVerb::Delete | VimVerb::Change), None, vim::Motion::PrevWord) => {
+                    self.delete_prev_word().await?
+                }
                 (Some(_), None, vim::Motion::EndOfWord) => todo!(),
                 (Some(_), None, vim::Motion::TextObject(_)) => todo!(),
                 (Some(_), Some(_), vim::Motion::Left) => todo!(),
@@ -276,9 +300,17 @@ impl<P: Prompt> Readline<P> {
                 (Some(_), Some(_), vim::Motion::NextWord) => todo!(),
                 (Some(_), Some(_), vim::Motion::PrevWord) => todo!(),
                 (Some(_), Some(_), vim::Motion::EndOfWord) => todo!(),
-                (Some(_), Some(_), vim::Motion::TextObject(_)) => todo!(),
+                (
+                    Some(VimVerb::Delete | VimVerb::Change),
+                    Some(Modifier::Around),
+                    vim::Motion::TextObject(c),
+                ) if VIM_DELIMITERS.contains(&c) => self.delete_around(c).await?,
                 _ => {}
             }
+        }
+
+        if command.verb == Some(VimVerb::Change) {
+            self.vim_mode = VimMode::Insert;
         }
 
         Ok(None)
@@ -632,7 +664,7 @@ impl<P: Prompt> Readline<P> {
                     }
                 }
                 BACKSPACE | 0x08 => {
-                    self.delete_word().await?;
+                    self.delete_prev_word().await?;
                 }
                 other => {
                     unimplemented!("pressed {}", other);
@@ -663,7 +695,7 @@ impl<P: Prompt> Readline<P> {
         Ok(())
     }
 
-    async fn delete_word(&mut self) -> io::Result<()> {
+    async fn delete_prev_word(&mut self) -> io::Result<()> {
         if self.input_cursor == 0 {
             return Ok(());
         };
@@ -683,6 +715,42 @@ impl<P: Prompt> Readline<P> {
         let from = if prev_space == 0 { 0 } else { prev_space + 1 };
         let deleted = self.buffer.drain(from..self.input_cursor).len();
         self.input_cursor -= deleted;
+        self.stdout.write_all(&self.buffer).await?;
+        if self.input_cursor != self.buffer.len() {
+            temp_buf.clear();
+            execute!(
+                temp_buf,
+                MoveLeft((self.buffer.len() - self.input_cursor) as u16)
+            )?;
+            self.stdout.write_all(&temp_buf).await?;
+        }
+        self.stdout.flush().await?;
+        Ok(())
+    }
+
+    async fn delete_next_word(&mut self) -> io::Result<()> {
+        if self.input_cursor >= self.buffer.len() {
+            return Ok(());
+        }
+
+        let next_space = self
+            .buffer
+            .get(self.input_cursor + 1..)
+            .and_then(|i| i.iter().position(|c| *c == b' '))
+            .unwrap_or(0);
+        let mut temp_buf = vec![];
+        execute!(temp_buf, Clear(ClearType::CurrentLine))?;
+        self.stdout.write_all(&temp_buf).await?;
+        self.stdout.write_all(b"\r").await?;
+        if let Some(prompt) = &self.prompt {
+            prompt.draw(&mut self.stdout).await?;
+        }
+        let to = if next_space == 0 {
+            self.buffer.len()
+        } else {
+            next_space + 1 + self.input_cursor
+        };
+        self.buffer.drain(self.input_cursor..to);
         self.stdout.write_all(&self.buffer).await?;
         if self.input_cursor != self.buffer.len() {
             temp_buf.clear();
@@ -723,5 +791,9 @@ impl<P: Prompt> Readline<P> {
 
     async fn move_cursor_to_prev_char(&mut self, c: char) -> io::Result<()> {
         self.move_cursor_left_to_char(c).await
+    }
+
+    async fn delete_around(&mut self, del: char) -> io::Result<()> {
+        todo!()
     }
 }

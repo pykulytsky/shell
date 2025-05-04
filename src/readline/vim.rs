@@ -31,6 +31,7 @@ pub const VIM_ENTER_INSERT_MODE_STROKES: &[char] = &[
 pub const VERB_DELETE: u8 = b'd';
 pub const VERB_CHANGE: u8 = b'c';
 pub const VERB_YANK: u8 = b'y';
+pub const VIM_DELIMITERS: &[char] = &['(', ')', '{', '}', '<', '>'];
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum VimVerb {

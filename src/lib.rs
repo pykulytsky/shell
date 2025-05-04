@@ -74,8 +74,8 @@ impl Shell {
         let mut readline = Readline::new_with_prompt(DirPrompt).await;
         readline.vim_mode_enabled = true;
         readline.autocomplete_options = self.autocomplete_options.clone();
+        let mut input = String::new();
         loop {
-            let mut input = String::new();
             if readline.read(&mut input).await? == Signal::CtrlD {
                 break;
             }
@@ -85,6 +85,7 @@ impl Shell {
                     Ok(command) => self.execute(command).await?,
                     Err(err) => stderr.write_all(format!("{err}\r\n").as_bytes()).await?,
                 }
+                input.clear();
             }
         }
 

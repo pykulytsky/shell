@@ -24,13 +24,9 @@ use crossterm::{
 use std::collections::VecDeque;
 use tokio::{
     io::{self, AsyncReadExt, AsyncWrite, AsyncWriteExt, Stdin, Stdout},
-    select,
     time::timeout,
 };
-use vim::{
-    VimMode, ENTER_INSERT_LINE_END, ENTER_INSERT_LINE_START, ENTER_INSERT_NEXT_CHAR, NEXT_WORD,
-    PREV_WORD, VIM_ENTER_INSERT_MODE_STROKES,
-};
+use vim::{Modifier, VimCommand, VimMode, VIM_ENTER_INSERT_MODE_STROKES};
 
 pub mod constants;
 pub mod signal;
@@ -150,41 +146,138 @@ impl<P: Prompt> Readline<P> {
     }
 
     async fn handle_input_event(&mut self, input: &mut String) -> io::Result<Option<Signal>> {
-        select! {
-            Ok(byte) = self.stdin.read_u8() => {
-                self.last_pressed = Some(byte);
-                match byte {
-                    RETURN | NEWLINE => {
-                        self.handle_newline(input).await?;
-                        return Ok(Some(Signal::Success));
-                    },
-                    CTRL_C => {
-                        self.handle_ctrl_c().await?;
-                    },
-                    CTRL_D => {
-                        self.handle_ctrl_d();
-                        return Ok(Some(Signal::CtrlD));
-                    },
-                    BACKSPACE => {
-                        self.handle_backspace().await?;
-                    },
-                    ESC => {
-                        self.handle_escape_sequence().await?;
-                    },
-                    OPTION_KEY => {
-                        self.handle_option_key(byte).await?;
-                    }
-                    TAB => {
-                        self.handle_autocomplete().await?;
-                    }
-                    _ => {
-                        self.handle_char(byte).await?;
-                    }
+        match (self.vim_mode_enabled, self.vim_mode) {
+            (true, VimMode::Normal) => self.handle_input_event_vim_normal(input).await,
+            (false, _) | (true, VimMode::Insert) => self.handle_input_event_default(input).await,
+        }
+    }
+
+    async fn handle_input_event_default(
+        &mut self,
+        input: &mut String,
+    ) -> io::Result<Option<Signal>> {
+        if let Ok(byte) = self.stdin.read_u8().await {
+            self.last_pressed = Some(byte);
+            match byte {
+                RETURN | NEWLINE => {
+                    self.handle_newline(input).await?;
+                    return Ok(Some(Signal::Success));
                 }
-            },
-            _ = tokio::signal::ctrl_c() => {
-                self.stdout.write_all(b"\r\n").await?;
-                self.stdout.flush().await?;
+                CTRL_C => {
+                    self.handle_ctrl_c().await?;
+                }
+                CTRL_D => {
+                    self.handle_exit();
+                    return Ok(Some(Signal::CtrlD));
+                }
+                BACKSPACE => {
+                    self.handle_backspace().await?;
+                }
+                ESC => {
+                    self.handle_escape_sequence().await?;
+                }
+                OPTION_KEY => {
+                    self.handle_option_key(byte).await?;
+                }
+                TAB => {
+                    self.handle_autocomplete().await?;
+                }
+                _ => {
+                    self.handle_char(byte).await?;
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn handle_input_event_vim_normal(
+        &mut self,
+        input: &mut String,
+    ) -> io::Result<Option<Signal>> {
+        let Some(command) = VimCommand::read(&mut self.stdin).await? else {
+            return Ok(None);
+        };
+
+        let count = if let Some(Modifier::Count(count)) = command.modifier {
+            count
+        } else {
+            1
+        };
+
+        for _ in 0..count {
+            match (command.verb, command.modifier, command.motion) {
+                (None, _, vim::Motion::Left) => self.handle_left_arrow().await?,
+                (None, _, vim::Motion::Right) => self.handle_right_arrow().await?,
+                (None, _, vim::Motion::Up) => {
+                    self.handle_history_change(HistoryDirection::Up).await?
+                }
+                (None, _, vim::Motion::Down) => {
+                    self.handle_history_change(HistoryDirection::Down).await?
+                }
+                (None, _, vim::Motion::LineStart) => self.move_cursor_to_line_start().await?,
+                (None, _, vim::Motion::LineEnd) => self.move_cursor_to_line_end().await?,
+                (None, _, vim::Motion::ToNextChar(c)) => self.move_cursor_to_next_char(c).await?,
+                (None, _, vim::Motion::ToPrevChar(c)) => self.move_cursor_to_prev_char(c).await?,
+                (None, _, vim::Motion::BeforeNextChar(c)) => {
+                    self.move_cursor_to_next_char(c).await?
+                }
+                (None, _, vim::Motion::BeforePrevChar(c)) => {
+                    self.move_cursor_to_prev_char(c).await?
+                }
+                (None, _, vim::Motion::NextWord) => self.move_cursor_word_right().await?,
+                (None, _, vim::Motion::PrevWord) => self.move_cursor_word_left().await?,
+                (None, _, vim::Motion::EndOfWord) => self.move_cursor_word_right().await?, // For now
+                // the same as `w`, handle it separately in the future.
+                (None, None, vim::Motion::TextObject(s))
+                    if VIM_ENTER_INSERT_MODE_STROKES.contains(&s) =>
+                {
+                    self.vim_mode = VimMode::Insert;
+                }
+                (None, None, vim::Motion::TextObject(s))
+                    if s == RETURN as char || s == NEWLINE as char =>
+                {
+                    self.handle_newline(input).await?;
+                    return Ok(Some(Signal::Success));
+                }
+                (None, None, vim::Motion::TextObject(s)) if s == CTRL_D as char => {
+                    self.handle_exit();
+                    return Ok(Some(Signal::CtrlD));
+                }
+                (None, None, vim::Motion::TextObject(s)) if s == CTRL_C as char => {
+                    self.handle_ctrl_c().await?;
+                    return Ok(Some(Signal::CtrlC));
+                }
+                (None, None, vim::Motion::TextObject(_)) => {}
+                (Some(_), None, vim::Motion::Left) => todo!(),
+                (Some(_), None, vim::Motion::Right) => todo!(),
+                (Some(_), None, vim::Motion::Up) => todo!(),
+                (Some(_), None, vim::Motion::Down) => todo!(),
+                (Some(_), None, vim::Motion::LineStart) => todo!(),
+                (Some(_), None, vim::Motion::LineEnd) => todo!(),
+                (Some(_), None, vim::Motion::ToNextChar(_)) => todo!(),
+                (Some(_), None, vim::Motion::ToPrevChar(_)) => todo!(),
+                (Some(_), None, vim::Motion::BeforeNextChar(_)) => todo!(),
+                (Some(_), None, vim::Motion::BeforePrevChar(_)) => todo!(),
+                (Some(_), None, vim::Motion::NextWord) => todo!(),
+                (Some(_), None, vim::Motion::PrevWord) => todo!(),
+                (Some(_), None, vim::Motion::EndOfWord) => todo!(),
+                (Some(_), None, vim::Motion::TextObject(_)) => todo!(),
+                (Some(_), Some(_), vim::Motion::Left) => todo!(),
+                (Some(_), Some(_), vim::Motion::Right) => todo!(),
+                (Some(_), Some(_), vim::Motion::Up) => todo!(),
+                (Some(_), Some(_), vim::Motion::Down) => todo!(),
+                (Some(_), Some(_), vim::Motion::LineStart) => todo!(),
+                (Some(_), Some(_), vim::Motion::LineEnd) => todo!(),
+                (Some(_), Some(_), vim::Motion::ToNextChar(_)) => todo!(),
+                (Some(_), Some(_), vim::Motion::ToPrevChar(_)) => todo!(),
+                (Some(_), Some(_), vim::Motion::BeforeNextChar(_)) => todo!(),
+                (Some(_), Some(_), vim::Motion::BeforePrevChar(_)) => todo!(),
+                (Some(_), Some(_), vim::Motion::NextWord) => todo!(),
+                (Some(_), Some(_), vim::Motion::PrevWord) => todo!(),
+                (Some(_), Some(_), vim::Motion::EndOfWord) => todo!(),
+                (Some(_), Some(_), vim::Motion::TextObject(_)) => todo!(),
+                _ => {}
             }
         }
 
@@ -326,14 +419,14 @@ impl<P: Prompt> Readline<P> {
         Ok(())
     }
 
-    async fn move_cursor_word_left(&mut self) -> io::Result<()> {
+    async fn move_cursor_left_to_char(&mut self, c: char) -> io::Result<()> {
         if self.input_cursor == 0 {
             return Ok(());
         }
         let mut temp_buf = vec![];
         if let Some(pos) = self.buffer[..self.input_cursor - 1]
             .iter()
-            .rposition(|c| *c == b' ')
+            .rposition(|i| *i == c as u8)
         {
             execute!(
                 temp_buf,
@@ -349,7 +442,7 @@ impl<P: Prompt> Readline<P> {
         Ok(())
     }
 
-    async fn move_cursor_word_right(&mut self) -> io::Result<()> {
+    async fn move_cursor_right_to_char(&mut self, c: char) -> io::Result<()> {
         if self.input_cursor >= self.buffer.len() {
             return Ok(());
         }
@@ -357,7 +450,7 @@ impl<P: Prompt> Readline<P> {
         let mut temp_buf = vec![];
         if let Some(pos) = self.buffer[self.input_cursor + 1..]
             .iter()
-            .position(|c| *c == b' ')
+            .position(|i| *i == c as u8)
         {
             execute!(temp_buf, MoveRight(pos as u16 + 1))?;
             self.input_cursor = pos + self.input_cursor + 1;
@@ -371,6 +464,14 @@ impl<P: Prompt> Readline<P> {
         self.stdout.write_all(&temp_buf).await?;
         self.stdout.flush().await?;
         Ok(())
+    }
+
+    async fn move_cursor_word_left(&mut self) -> io::Result<()> {
+        self.move_cursor_left_to_char(' ').await
+    }
+
+    async fn move_cursor_word_right(&mut self) -> io::Result<()> {
+        self.move_cursor_right_to_char(' ').await
     }
 
     async fn handle_right_arrow(&mut self) -> io::Result<()> {
@@ -403,7 +504,7 @@ impl<P: Prompt> Readline<P> {
         Ok(())
     }
 
-    fn handle_ctrl_d(&mut self) {
+    fn handle_exit(&mut self) {
         self.buffer.clear();
         self.history_cursor = None;
     }
@@ -438,40 +539,41 @@ impl<P: Prompt> Readline<P> {
     }
 
     async fn handle_char_vim_normal_mode(&mut self, byte: u8) -> io::Result<()> {
-        if VIM_ENTER_INSERT_MODE_STROKES.contains(&byte) {
-            self.vim_mode = VimMode::Insert;
-        }
-
-        match byte {
-            ENTER_INSERT_NEXT_CHAR | b'l' => {
-                self.handle_right_arrow().await?;
-            }
-            ENTER_INSERT_LINE_END | b'$' => {
-                self.move_cursor_to_line_end().await?;
-            }
-            ENTER_INSERT_LINE_START | b'0' => {
-                self.move_cursor_to_line_start().await?;
-            }
-            // TODO handle `e` independentally
-            NEXT_WORD | b'e' => {
-                self.move_cursor_word_right().await?;
-            }
-            PREV_WORD => {
-                self.move_cursor_word_left().await?;
-            }
-            b'h' => {
-                self.handle_left_arrow().await?;
-            }
-            b'k' => {
-                self.handle_history_change(HistoryDirection::Up).await?;
-            }
-            b'j' => {
-                self.handle_history_change(HistoryDirection::Up).await?;
-            }
-
-            _ => {}
-        }
-        Ok(())
+        // if VIM_ENTER_INSERT_MODE_STROKES.contains(&byte) {
+        //     self.vim_mode = VimMode::Insert;
+        // }
+        //
+        // match byte {
+        //     ENTER_INSERT_NEXT_CHAR | b'l' => {
+        //         self.handle_right_arrow().await?;
+        //     }
+        //     ENTER_INSERT_LINE_END | b'$' => {
+        //         self.move_cursor_to_line_end().await?;
+        //     }
+        //     ENTER_INSERT_LINE_START | b'0' => {
+        //         self.move_cursor_to_line_start().await?;
+        //     }
+        //     // TODO handle `e` independentally
+        //     NEXT_WORD | b'e' => {
+        //         self.move_cursor_word_right().await?;
+        //     }
+        //     PREV_WORD => {
+        //         self.move_cursor_word_left().await?;
+        //     }
+        //     b'h' => {
+        //         self.handle_left_arrow().await?;
+        //     }
+        //     b'k' => {
+        //         self.handle_history_change(HistoryDirection::Up).await?;
+        //     }
+        //     b'j' => {
+        //         self.handle_history_change(HistoryDirection::Up).await?;
+        //     }
+        //
+        //     _ => {}
+        // }
+        // Ok(())
+        todo!()
     }
 
     async fn handle_char(&mut self, byte: u8) -> io::Result<()> {
@@ -613,5 +715,13 @@ impl<P: Prompt> Readline<P> {
         self.input_cursor = 0;
         self.stdout.flush().await?;
         Ok(())
+    }
+
+    async fn move_cursor_to_next_char(&mut self, c: char) -> io::Result<()> {
+        self.move_cursor_right_to_char(c).await
+    }
+
+    async fn move_cursor_to_prev_char(&mut self, c: char) -> io::Result<()> {
+        self.move_cursor_left_to_char(c).await
     }
 }

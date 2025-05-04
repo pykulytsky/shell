@@ -1,15 +1,15 @@
 use tokio::io::{self, AsyncRead, AsyncReadExt};
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum VimMode {
     Normal,
     Insert,
 }
 
-pub const VIM_ENTER_INSERT: u8 = b'i';
-pub const ENTER_INSERT_LINE_START: u8 = b'I';
-pub const ENTER_INSERT_NEXT_CHAR: u8 = b'a';
-pub const ENTER_INSERT_LINE_END: u8 = b'A';
+pub const VIM_ENTER_INSERT: char = 'i';
+pub const ENTER_INSERT_LINE_START: char = 'I';
+pub const ENTER_INSERT_NEXT_CHAR: char = 'a';
+pub const ENTER_INSERT_LINE_END: char = 'A';
 
 pub const NEXT_WORD: u8 = b'w';
 pub const PREV_WORD: u8 = b'b';
@@ -21,7 +21,7 @@ pub const VERBS: &[u8] = &[b'd', b'c', b'y'];
 pub const MODIFIERS: &[u8] = &[b'i', b'a'];
 
 #[allow(clippy::byte_char_slices)]
-pub const VIM_ENTER_INSERT_MODE_STROKES: &[u8] = &[
+pub const VIM_ENTER_INSERT_MODE_STROKES: &[char] = &[
     VIM_ENTER_INSERT,
     ENTER_INSERT_LINE_START,
     ENTER_INSERT_NEXT_CHAR,
@@ -32,7 +32,7 @@ pub const VERB_DELETE: u8 = b'd';
 pub const VERB_CHANGE: u8 = b'c';
 pub const VERB_YANK: u8 = b'y';
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum VimVerb {
     Change,
     Delete,
@@ -40,7 +40,7 @@ pub enum VimVerb {
     Yank,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Modifier {
     /// When you press for example <2>dd to delete two lines in a row
     Count(u16),
@@ -48,13 +48,14 @@ pub enum Modifier {
     Around,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum Motion {
     Left,
     Right,
     Up,
     Down,
-    LineStart,
+    LineStart, // TODO: fix reading `0`, as for now i presume it is handled as ascii digit and
+    // counted as modifier
     LineEnd,
     ToNextChar(char),
     ToPrevChar(char),
@@ -87,7 +88,7 @@ impl VimCommand {
         let mut modifier = None;
         let motion;
         loop {
-            let byte = if verb.is_some() {
+            let byte = if verb.is_some() || modifier.is_some() {
                 stdin.read_u8().await?
             } else {
                 byte
@@ -96,12 +97,14 @@ impl VimCommand {
                 match byte {
                     b'a' => modifier = Some(Modifier::Around),
                     b'i' => modifier = Some(Modifier::Inner),
-                    b if b.is_ascii_digit() => {
+                    b if b.is_ascii_digit() && b != b'0' => {
                         // [TODO] fix this
                         if let Some(Modifier::Count(ref mut modifier)) = modifier {
-                            *modifier = *modifier * 10 + b.to_string().parse::<u16>().unwrap();
+                            *modifier =
+                                (*modifier * 10) + (b.to_string().parse::<u16>().unwrap() - 48);
                         } else {
-                            modifier = Some(Modifier::Count(b.to_string().parse().unwrap()));
+                            modifier =
+                                Some(Modifier::Count(b.to_string().parse::<u16>().unwrap() - 48));
                         }
                     }
                     _ => {}
@@ -150,7 +153,7 @@ impl VimCommand {
             return Ok(None);
         }
 
-        // Escape is pressed at any time, means we discard the motion.
+        // Escape is pressed at any time, means we discard the command.
         if motion == Some(Motion::TextObject('\u{1b}')) {
             return Ok(None);
         }
@@ -168,5 +171,5 @@ pub fn is_verb(byte: &u8) -> bool {
 }
 
 pub fn is_modifier(byte: &u8, verb: &Option<VimVerb>) -> bool {
-    (MODIFIERS.contains(byte) && verb.is_some()) || byte.is_ascii_digit()
+    (MODIFIERS.contains(byte) && verb.is_some()) || (byte.is_ascii_digit() && *byte != b'0')
 }

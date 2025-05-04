@@ -28,8 +28,7 @@ use tokio::{
 };
 
 use vim::{
-    Modifier, VimCommand, VimMode, VimVerb, ENTER_INSERT_LINE_END, ENTER_INSERT_LINE_START,
-    ENTER_INSERT_NEXT_CHAR, VIM_DELIMITERS, VIM_ENTER_INSERT_MODE_STROKES,
+    get_matching_delimiters, Modifier, VimCommand, VimMode, VimVerb, ENTER_INSERT_LINE_END, ENTER_INSERT_LINE_START, ENTER_INSERT_NEXT_CHAR, VIM_DELIMITERS, VIM_ENTER_INSERT, VIM_ENTER_INSERT_MODE_STROKES
 };
 
 pub mod constants;
@@ -248,6 +247,7 @@ impl<P: Prompt> Readline<P> {
                         ENTER_INSERT_LINE_START => {
                             self.move_cursor_to_line_start().await?;
                         }
+                        VIM_ENTER_INSERT => {}
                         _ => unreachable!(),
                     }
                 }
@@ -302,7 +302,7 @@ impl<P: Prompt> Readline<P> {
                 (Some(_), Some(_), vim::Motion::EndOfWord) => todo!(),
                 (
                     Some(VimVerb::Delete | VimVerb::Change),
-                    Some(Modifier::Around),
+                    Some(Modifier::Around | Modifier::Inner),
                     vim::Motion::TextObject(c),
                 ) if VIM_DELIMITERS.contains(&c) => self.delete_around(c).await?,
                 _ => {}
@@ -570,49 +570,7 @@ impl<P: Prompt> Readline<P> {
         Ok(())
     }
 
-    async fn handle_char_vim_normal_mode(&mut self, byte: u8) -> io::Result<()> {
-        // if VIM_ENTER_INSERT_MODE_STROKES.contains(&byte) {
-        //     self.vim_mode = VimMode::Insert;
-        // }
-        //
-        // match byte {
-        //     ENTER_INSERT_NEXT_CHAR | b'l' => {
-        //         self.handle_right_arrow().await?;
-        //     }
-        //     ENTER_INSERT_LINE_END | b'$' => {
-        //         self.move_cursor_to_line_end().await?;
-        //     }
-        //     ENTER_INSERT_LINE_START | b'0' => {
-        //         self.move_cursor_to_line_start().await?;
-        //     }
-        //     // TODO handle `e` independentally
-        //     NEXT_WORD | b'e' => {
-        //         self.move_cursor_word_right().await?;
-        //     }
-        //     PREV_WORD => {
-        //         self.move_cursor_word_left().await?;
-        //     }
-        //     b'h' => {
-        //         self.handle_left_arrow().await?;
-        //     }
-        //     b'k' => {
-        //         self.handle_history_change(HistoryDirection::Up).await?;
-        //     }
-        //     b'j' => {
-        //         self.handle_history_change(HistoryDirection::Up).await?;
-        //     }
-        //
-        //     _ => {}
-        // }
-        // Ok(())
-        todo!()
-    }
-
     async fn handle_char(&mut self, byte: u8) -> io::Result<()> {
-        if self.vim_mode_enabled && self.vim_mode == VimMode::Normal {
-            return self.handle_char_vim_normal_mode(byte).await;
-        }
-
         if !self.buffer.is_empty() && self.input_cursor != self.buffer.len() {
             self.buffer.insert(self.input_cursor, byte);
             let mut temp_buf = vec![];
@@ -695,7 +653,7 @@ impl<P: Prompt> Readline<P> {
         Ok(())
     }
 
-    async fn delete_prev_word(&mut self) -> io::Result<()> {
+    async fn delete_to_char_prev(&mut self, c: char) -> io::Result<()> {
         if self.input_cursor == 0 {
             return Ok(());
         };
@@ -703,7 +661,7 @@ impl<P: Prompt> Readline<P> {
         let prev_space = self
             .buffer
             .get(..self.input_cursor - 1)
-            .and_then(|i| i.iter().rposition(|c| *c == b' '))
+            .and_then(|i| i.iter().rposition(|i| *i == c as u8))
             .unwrap_or(0);
         let mut temp_buf = vec![];
         execute!(temp_buf, Clear(ClearType::CurrentLine))?;
@@ -728,7 +686,11 @@ impl<P: Prompt> Readline<P> {
         Ok(())
     }
 
-    async fn delete_next_word(&mut self) -> io::Result<()> {
+    async fn delete_prev_word(&mut self) -> io::Result<()> {
+        self.delete_to_char_prev(' ').await
+    }
+
+    async fn delete_to_char(&mut self, c: char) -> io::Result<()> {
         if self.input_cursor >= self.buffer.len() {
             return Ok(());
         }
@@ -736,7 +698,7 @@ impl<P: Prompt> Readline<P> {
         let next_space = self
             .buffer
             .get(self.input_cursor + 1..)
-            .and_then(|i| i.iter().position(|c| *c == b' '))
+            .and_then(|i| i.iter().position(|i| *i == c as u8))
             .unwrap_or(0);
         let mut temp_buf = vec![];
         execute!(temp_buf, Clear(ClearType::CurrentLine))?;
@@ -762,6 +724,10 @@ impl<P: Prompt> Readline<P> {
         }
         self.stdout.flush().await?;
         Ok(())
+    }
+
+    async fn delete_next_word(&mut self) -> io::Result<()> {
+        self.delete_to_char(' ').await
     }
 
     async fn move_cursor_to_line_end(&mut self) -> io::Result<()> {
@@ -794,6 +760,45 @@ impl<P: Prompt> Readline<P> {
     }
 
     async fn delete_around(&mut self, del: char) -> io::Result<()> {
-        todo!()
+        let Some((left_delim, right_delim)) = get_matching_delimiters(del) else {
+            return Ok(());
+        };
+        let Some(left_delim_pos) = self
+            .buffer
+            .get(..self.input_cursor - 1)
+            .and_then(|i| i.iter().rposition(|i| *i == left_delim as u8))
+        else {
+            return Ok(());
+        };
+
+        let Some(right_delim_pos) = self
+            .buffer
+            .get(self.input_cursor + 1..)
+            .and_then(|i| i.iter().position(|i| *i == right_delim as u8))
+        else {
+            return Ok(());
+        };
+
+        let deleted = self
+            .buffer
+            .drain(left_delim_pos + 1..right_delim_pos + self.input_cursor + 1)
+            .len();
+        let mut temp_buf = vec![];
+        execute!(temp_buf, Clear(ClearType::CurrentLine))?;
+        self.stdout.write_all(&temp_buf).await?;
+        self.stdout.write_all(b"\r").await?;
+        if let Some(prompt) = &self.prompt {
+            prompt.draw(&mut self.stdout).await?;
+        }
+        self.stdout.write_all(&self.buffer).await?;
+
+        if self.input_cursor != self.buffer.len() {
+            temp_buf.clear();
+            execute!(temp_buf, MoveLeft(1))?;
+            self.stdout.write_all(&temp_buf).await?;
+        }
+        self.stdout.flush().await?;
+        self.input_cursor -= deleted - 2;
+        Ok(())
     }
 }

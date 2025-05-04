@@ -411,3 +411,4 @@ async fn open_file_async<P: AsRef<Path>>(path: P, append: bool) -> io::Result<to
         .open(path)
         .await
 }
+

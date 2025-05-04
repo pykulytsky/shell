@@ -174,3 +174,12 @@ pub fn is_verb(byte: &u8) -> bool {
 pub fn is_modifier(byte: &u8, verb: &Option<VimVerb>) -> bool {
     (MODIFIERS.contains(byte) && verb.is_some()) || (byte.is_ascii_digit() && *byte != b'0')
 }
+
+pub fn get_matching_delimiters(c: char) -> Option<(char, char)> {
+    match c {
+        '(' | ')' => Some(('(' , ')')),
+        '{' | '}' => Some(('{' , '}')),
+        '<' | '>' => Some(('<' , '>')),
+        _ => None
+    }
+}

@@ -28,7 +28,9 @@ use tokio::{
 };
 
 use vim::{
-    get_matching_delimiters, Modifier, VimCommand, VimMode, VimVerb, ENTER_INSERT_LINE_END, ENTER_INSERT_LINE_START, ENTER_INSERT_NEXT_CHAR, VIM_DELIMITERS, VIM_ENTER_INSERT, VIM_ENTER_INSERT_MODE_STROKES
+    get_matching_delimiters, Modifier, VimCommand, VimMode, VimVerb, ENTER_INSERT_LINE_END,
+    ENTER_INSERT_LINE_START, ENTER_INSERT_NEXT_CHAR, VIM_DELIMITERS, VIM_ENTER_INSERT,
+    VIM_ENTER_INSERT_MODE_STROKES,
 };
 
 pub mod constants;

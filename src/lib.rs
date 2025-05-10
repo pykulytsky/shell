@@ -28,6 +28,7 @@ pub mod autocomplete;
 pub mod command;
 pub mod prompt;
 pub mod readline;
+mod tokenizer;
 
 #[macro_export]
 macro_rules! debug {
@@ -411,4 +412,3 @@ async fn open_file_async<P: AsRef<Path>>(path: P, append: bool) -> io::Result<to
         .open(path)
         .await
 }
-

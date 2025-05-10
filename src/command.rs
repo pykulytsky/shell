@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use crate::{parse_prompt, readline::constants::REDIRECTS, Shell};
 use thiserror::Error;
 
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy, PartialOrd)]
 pub enum SinkKind {
     Stdout,
     Stderr,

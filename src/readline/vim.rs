@@ -177,9 +177,9 @@ pub fn is_modifier(byte: &u8, verb: &Option<VimVerb>) -> bool {
 
 pub fn get_matching_delimiters(c: char) -> Option<(char, char)> {
     match c {
-        '(' | ')' => Some(('(' , ')')),
-        '{' | '}' => Some(('{' , '}')),
-        '<' | '>' => Some(('<' , '>')),
-        _ => None
+        '(' | ')' => Some(('(', ')')),
+        '{' | '}' => Some(('{', '}')),
+        '<' | '>' => Some(('<', '>')),
+        _ => None,
     }
 }

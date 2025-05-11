@@ -8,7 +8,6 @@ use prompt::DirPrompt;
 use readline::constants::{BUILTINS, DOUBLE_QUOTES_ESCAPE, GLOB};
 use readline::signal::Signal;
 use readline::Readline;
-use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::future::Future;
@@ -166,35 +165,16 @@ impl Shell {
 
         match command.kind {
             CommandKind::Exit { status_code } => exit(status_code),
-            CommandKind::ExternalCommand {
-                ref name,
-                ref input,
-            } => {
+            CommandKind::ExternalCommand { .. } => {
                 if command.is_bg_job {
-                    let name = name.clone();
-                    let command = command.clone();
-                    let input = input.clone();
                     let channel = self._bg_job_remove_txs.clone();
-                    let job = execute_external_command(
-                        self.path.clone(),
-                        command,
-                        name,
-                        input,
-                        None,
-                        Some(channel),
-                    );
+                    let job =
+                        execute_external_command(self.path.clone(), command, None, Some(channel));
                     let handle = tokio::spawn(job);
                     self.bg_jobs.push(handle);
                 } else {
-                    let exit_status = execute_external_command(
-                        self.path.clone(),
-                        command.clone(),
-                        name.clone(),
-                        input,
-                        None,
-                        None,
-                    )
-                    .await?;
+                    let exit_status =
+                        execute_external_command(self.path.clone(), command, None, None).await?;
                     self.last_status = Some(exit_status);
                 }
             }
@@ -383,19 +363,16 @@ async fn open_file_async<P: AsRef<Path>>(path: P, append: bool) -> io::Result<to
         .await
 }
 
-fn execute_external_command<'a, I, S>(
+fn execute_external_command<'a>(
     path: String,
     command: Command,
-    name: OsString,
-    input: I,
     pipe_input: Option<Vec<u8>>,
     channel: Option<UnboundedSender<tokio::task::Id>>,
-) -> Pin<Box<dyn Future<Output = io::Result<ExitStatus>> + 'a + Send>>
-where
-    I: IntoIterator<Item = S> + 'a + Send,
-    S: AsRef<OsStr>,
-{
+) -> Pin<Box<dyn Future<Output = io::Result<ExitStatus>> + 'a + Send>> {
     Box::pin(async move {
+        let CommandKind::ExternalCommand { name, input } = command.kind else {
+            return Ok(ExitStatus::default());
+        };
         let canonical_name = canonicalize_path(
             path.clone(),
             name.to_str()
@@ -439,28 +416,16 @@ where
         }
 
         let status = if let Some(sub) = command.pipe_to {
-            if let CommandKind::ExternalCommand {
-                ref name,
-                ref input,
-            } = sub.kind
-            {
+            if let CommandKind::ExternalCommand { .. } = sub.kind {
                 let output = child.wait_with_output().await?;
-                execute_external_command(
-                    path.clone(),
-                    *sub.clone(),
-                    name.to_owned(),
-                    input.to_owned(),
-                    Some(output.stdout),
-                    None,
-                )
-                .await?;
+                execute_external_command(path.clone(), *sub.clone(), Some(output.stdout), None)
+                    .await?;
                 output.status
             } else {
                 ExitStatus::default()
             }
         } else {
             child.wait().await?
-            // self.last_status = Some(status);
         };
         enable_raw_mode()?;
 

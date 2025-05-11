@@ -1,6 +1,6 @@
 use std::ffi::OsString;
 
-use crate::{parse_prompt, readline::constants::REDIRECTS, Shell};
+use crate::{parse_prompt, readline::constants::REDIRECTS};
 use thiserror::Error;
 
 #[derive(Debug, PartialEq, Clone, Copy, PartialOrd)]
@@ -30,13 +30,20 @@ pub enum CommandKind {
     History,
 }
 
-#[derive(Debug, Clone)]
+impl Default for CommandKind {
+    fn default() -> Self {
+        Self::Exit { status_code: 0 }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct Command {
     pub kind: CommandKind,
     pub stdout_redirect: Option<String>,
     pub stderr_redirect: Option<String>,
     pub sink: Option<SinkKind>,
     pub pipe_to: Option<Box<Command>>,
+    pub is_bg_job: bool,
 }
 
 #[derive(Debug, Error)]
@@ -49,14 +56,14 @@ pub enum CommandError {
 }
 
 impl Command {
-    pub async fn parse(input: &str, shell: &Shell) -> Result<Command, CommandError> {
+    pub async fn parse(input: &str) -> Result<Command, CommandError> {
         let args = parse_prompt(input);
 
         let subcommand_strs = args.split(|a| a == "|");
         let mut commands = vec![];
 
         for subcommand_str in subcommand_strs {
-            commands.push(Self::read(subcommand_str.to_vec(), shell).await?);
+            commands.push(Self::read(subcommand_str.to_vec()).await?);
         }
 
         let mut iter = commands.into_iter().rev();
@@ -70,7 +77,7 @@ impl Command {
         Ok(command)
     }
 
-    pub async fn read(mut args: Vec<String>, shell: &Shell) -> Result<Command, CommandError> {
+    pub async fn read(mut args: Vec<String>) -> Result<Command, CommandError> {
         use CommandKind::*;
 
         let redirect_pos = args.iter().position(|a| REDIRECTS.contains(&a.as_str()));
@@ -92,6 +99,15 @@ impl Command {
             args.pop(); // remove sink
         }
 
+        let mut is_bg_job = false;
+
+        if let Some(last) = args.last() {
+            if last == "&" {
+                is_bg_job = true;
+                args.pop();
+            }
+        }
+
         let kind = match args[0].as_str() {
             "exit" => Exit {
                 status_code: match args.get(1) {
@@ -104,13 +120,7 @@ impl Command {
             },
             "history" => History,
             arg => {
-                let name = shell
-                    .get_path_executable(arg)
-                    .await
-                    .or(shell.get_local_executable(arg).await.as_ref())
-                    .ok_or(CommandError::InvalidCommand(arg.to_string()))?
-                    .path()
-                    .into_os_string();
+                let name = OsString::from(arg);
 
                 ExternalCommand {
                     name,
@@ -123,23 +133,22 @@ impl Command {
             (Some(to), Some(SinkKind::Stdout | SinkKind::StdoutAppend)) => Ok(Command {
                 kind,
                 stdout_redirect: Some(to),
-                stderr_redirect: None,
                 sink,
-                pipe_to: None,
+                is_bg_job,
+                ..Default::default()
             }),
             (Some(to), Some(SinkKind::Stderr | SinkKind::StderrAppend)) => Ok(Command {
                 kind,
-                stdout_redirect: None,
                 stderr_redirect: Some(to),
                 sink,
-                pipe_to: None,
+                is_bg_job,
+                ..Default::default()
             }),
             _ => Ok(Command {
                 kind,
-                stdout_redirect: None,
-                stderr_redirect: None,
                 sink,
-                pipe_to: None,
+                is_bg_job,
+                ..Default::default()
             }),
         }
     }

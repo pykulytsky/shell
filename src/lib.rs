@@ -17,6 +17,9 @@ use std::path::Path;
 use std::pin::Pin;
 use std::process::{exit, ExitStatus, Stdio};
 use tokio::io::{stderr, stdout, AsyncWrite};
+use tokio::select;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::task::JoinHandle;
 use tokio::{
     fs::{read_dir, DirEntry},
     io::{self, AsyncWriteExt},
@@ -39,12 +42,15 @@ macro_rules! debug {
     };
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Shell {
     path: String,
     path_executables: Vec<DirEntry>,
     last_status: Option<ExitStatus>,
     pub autocomplete_options: Trie,
+    bg_jobs: Vec<JoinHandle<io::Result<ExitStatus>>>,
+    bg_job_remove_channel: UnboundedReceiver<tokio::task::Id>, // store PID
+    _bg_job_remove_txs: UnboundedSender<tokio::task::Id>,
 }
 
 impl Shell {
@@ -61,11 +67,16 @@ impl Shell {
             }
         }
 
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
         Self {
             path,
             path_executables,
             last_status: None,
             autocomplete_options,
+            bg_jobs: vec![],
+            bg_job_remove_channel: rx,
+            _bg_job_remove_txs: tx,
         }
     }
 
@@ -77,23 +88,35 @@ impl Shell {
         readline.autocomplete_options = self.autocomplete_options.clone();
         let mut input = String::new();
         loop {
-            if readline.read(&mut input).await? == Signal::CtrlD {
-                break;
-            }
+            select! {
+                Some(job_id) = self.bg_job_remove_channel.recv() => {
+                    self.handle_bg_job_completition(job_id).await?;
+                },
+                signal = readline.read(&mut input) => {
 
-            if !input.is_empty() {
-                match Command::parse(input.trim_start(), self).await {
-                    Ok(command) => self.execute(command).await?,
-                    Err(err) => stderr.write_all(format!("{err}\r\n").as_bytes()).await?,
+                    if signal? == Signal::CtrlD {
+                        break;
+                    }
+
+                    if !input.is_empty() {
+                        match Command::parse(input.trim_start()).await {
+                            Ok(command) => self.execute(command).await?,
+                            Err(err) => stderr.write_all(format!("{err}\r\n").as_bytes()).await?,
+                        }
+                        input.clear();
+                    }
                 }
-                input.clear();
+
+            }
+            if let Some(status) = self.last_status.and_then(|s| s.code()) {
+                std::env::set_var("status", status.to_string());
             }
         }
 
         Ok(())
     }
 
-    async fn get_path_executable(&self, name: &str) -> Option<&DirEntry> {
+    pub async fn get_path_executable(&self, name: &str) -> Option<&DirEntry> {
         self.path_executables.iter().find(|e| {
             e.path()
                 .components()
@@ -147,8 +170,33 @@ impl Shell {
                 ref name,
                 ref input,
             } => {
-                self.execute_external_command(command.clone(), name.clone(), input, None)
+                if command.is_bg_job {
+                    let name = name.clone();
+                    let command = command.clone();
+                    let input = input.clone();
+                    let channel = self._bg_job_remove_txs.clone();
+                    let job = execute_external_command(
+                        self.path.clone(),
+                        command,
+                        name,
+                        input,
+                        None,
+                        Some(channel),
+                    );
+                    let handle = tokio::spawn(job);
+                    self.bg_jobs.push(handle);
+                } else {
+                    let exit_status = execute_external_command(
+                        self.path.clone(),
+                        command.clone(),
+                        name.clone(),
+                        input,
+                        None,
+                        None,
+                    )
                     .await?;
+                    self.last_status = Some(exit_status);
+                }
             }
             CommandKind::Cd { path } => {
                 let home = std::env::var("HOME").unwrap();
@@ -171,97 +219,6 @@ impl Shell {
         Ok(())
     }
 
-    fn execute_external_command<'a, I, S>(
-        &'a mut self,
-        command: Command,
-        name: OsString,
-        input: I,
-        pipe_input: Option<Vec<u8>>,
-    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + 'a>>
-    where
-        I: IntoIterator<Item = S> + 'a,
-        S: AsRef<OsStr>,
-    {
-        Box::pin(async move {
-            let canonical_name = self
-                .canonicalize_path(
-                    name.to_str()
-                        .ok_or(io::Error::other("Can not convert name to string"))?,
-                )
-                .ok_or(io::Error::other("Can not canonicalize path"))?;
-            disable_raw_mode()?;
-            let stdout = if command.pipe_to.is_some() {
-                Stdio::piped()
-            } else {
-                command
-                    .stdout_redirect
-                    .and_then(|stdout| {
-                        open_file(stdout, command.sink == Some(SinkKind::StdoutAppend)).ok()
-                    })
-                    .map(Stdio::from)
-                    .unwrap_or(Stdio::inherit())
-            };
-            let stderr = command
-                .stderr_redirect
-                .and_then(|stderr| {
-                    open_file(stderr, command.sink == Some(SinkKind::StderrAppend)).ok()
-                })
-                .map(Stdio::from)
-                .unwrap_or(Stdio::inherit());
-
-            let stdin = if pipe_input.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::inherit()
-            };
-            let mut child = SysCommand::new(canonical_name)
-                .args(input)
-                .stdin(stdin)
-                .stdout(stdout)
-                .stderr(stderr)
-                .spawn()?;
-
-            if let Some(pipe_input) = pipe_input {
-                if let Some(ref mut stdin) = child.stdin {
-                    stdin.write_all(&pipe_input).await?;
-                }
-            }
-
-            if let Some(sub) = command.pipe_to {
-                if let CommandKind::ExternalCommand {
-                    ref name,
-                    ref input,
-                } = sub.kind
-                {
-                    let output = child.wait_with_output().await?;
-                    self.execute_external_command(
-                        *sub.clone(),
-                        name.to_owned(),
-                        input.to_owned(),
-                        Some(output.stdout),
-                    )
-                    .await?;
-                    self.last_status = Some(output.status);
-                }
-            } else {
-                let status = child.wait().await?;
-                self.last_status = Some(status);
-            }
-            enable_raw_mode()?;
-
-            Ok(())
-        })
-    }
-
-    pub fn canonicalize_path<P: AsRef<str> + ?Sized>(&self, path: &P) -> Option<String> {
-        for p in self.path.split(":") {
-            if path.as_ref().contains(p) {
-                return Some(path.as_ref().replace(p, "").replace("/", ""));
-            }
-        }
-        Some(path.as_ref().to_string())
-    }
-
     async fn dump_history<S: AsyncWrite + Unpin>(&mut self, _sink: &mut S) -> io::Result<()> {
         // [TODO] update this function with regards to the fact that history is now handled by
         // [`Readline`]
@@ -275,6 +232,18 @@ impl Shell {
         // }
         Ok(())
     }
+
+    async fn handle_bg_job_completition(&mut self, job_id: tokio::task::Id) -> io::Result<()> {
+        if let Some(job) = self
+            .bg_jobs
+            .iter()
+            .position(|id| id.id() == job_id)
+            .map(|pos| self.bg_jobs.remove(pos))
+        {
+            self.last_status = Some(job.await??); // Probably should not propagate
+        }
+        Ok(())
+    }
 }
 
 fn set_color_envs() {
@@ -282,6 +251,7 @@ fn set_color_envs() {
     std::env::set_var("CLICOLOR", "truecolor");
     std::env::set_var("CLICOLOR_FORCE", "1");
     std::env::set_var("TERM", "tmux-256color");
+    std::env::set_var("status", "0");
 }
 
 pub fn parse_prompt(args: &str) -> Vec<String> {
@@ -411,4 +381,102 @@ async fn open_file_async<P: AsRef<Path>>(path: P, append: bool) -> io::Result<to
         .truncate(!append)
         .open(path)
         .await
+}
+
+fn execute_external_command<'a, I, S>(
+    path: String,
+    command: Command,
+    name: OsString,
+    input: I,
+    pipe_input: Option<Vec<u8>>,
+    channel: Option<UnboundedSender<tokio::task::Id>>,
+) -> Pin<Box<dyn Future<Output = io::Result<ExitStatus>> + 'a + Send>>
+where
+    I: IntoIterator<Item = S> + 'a + Send,
+    S: AsRef<OsStr>,
+{
+    Box::pin(async move {
+        let canonical_name = canonicalize_path(
+            path.clone(),
+            name.to_str()
+                .ok_or(io::Error::other("Can not convert name to string"))?,
+        )
+        .ok_or(io::Error::other("Can not canonicalize path"))?;
+        disable_raw_mode()?;
+        let stdout = if command.pipe_to.is_some() {
+            Stdio::piped()
+        } else {
+            command
+                .stdout_redirect
+                .and_then(|stdout| {
+                    open_file(stdout, command.sink == Some(SinkKind::StdoutAppend)).ok()
+                })
+                .map(Stdio::from)
+                .unwrap_or(Stdio::inherit())
+        };
+        let stderr = command
+            .stderr_redirect
+            .and_then(|stderr| open_file(stderr, command.sink == Some(SinkKind::StderrAppend)).ok())
+            .map(Stdio::from)
+            .unwrap_or(Stdio::inherit());
+
+        let stdin = if pipe_input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::inherit()
+        };
+        let mut child = SysCommand::new(canonical_name)
+            .args(input)
+            .stdin(stdin)
+            .stdout(stdout)
+            .stderr(stderr)
+            .spawn()?;
+
+        if let Some(pipe_input) = pipe_input {
+            if let Some(ref mut stdin) = child.stdin {
+                stdin.write_all(&pipe_input).await?;
+            }
+        }
+
+        let status = if let Some(sub) = command.pipe_to {
+            if let CommandKind::ExternalCommand {
+                ref name,
+                ref input,
+            } = sub.kind
+            {
+                let output = child.wait_with_output().await?;
+                execute_external_command(
+                    path.clone(),
+                    *sub.clone(),
+                    name.to_owned(),
+                    input.to_owned(),
+                    Some(output.stdout),
+                    None,
+                )
+                .await?;
+                output.status
+            } else {
+                ExitStatus::default()
+            }
+        } else {
+            child.wait().await?
+            // self.last_status = Some(status);
+        };
+        enable_raw_mode()?;
+
+        if let Some(channel) = channel {
+            let _ = channel.send(tokio::task::id());
+        }
+
+        Ok(status)
+    })
+}
+
+pub fn canonicalize_path<P: AsRef<str> + ?Sized>(shell_path: String, path: &P) -> Option<String> {
+    for p in shell_path.split(":") {
+        if path.as_ref().contains(p) {
+            return Some(path.as_ref().replace(p, "").replace("/", ""));
+        }
+    }
+    Some(path.as_ref().to_string())
 }

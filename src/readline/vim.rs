@@ -102,10 +102,10 @@ impl VimCommand {
                         // [TODO] fix this
                         if let Some(Modifier::Count(ref mut modifier)) = modifier {
                             *modifier =
-                                (*modifier * 10) + (b.to_string().parse::<u16>().unwrap() - 48);
+                                (*modifier * 10) + ((b as char).to_digit(10).unwrap() as u16);
                         } else {
                             modifier =
-                                Some(Modifier::Count(b.to_string().parse::<u16>().unwrap() - 48));
+                                Some(Modifier::Count((b as char).to_digit(10).unwrap() as u16));
                         }
                     }
                     _ => {}

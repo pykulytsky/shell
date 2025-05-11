@@ -21,7 +21,7 @@ pub(crate) enum Token {
     LeftParen,
     RightParen,
     Dollar,
-    NumberLiteral(usize),
+    NumberLiteral(u32),
     GlobPattern(String),
 }
 
@@ -63,6 +63,9 @@ impl Iterator for Tokenizer<'_> {
                 }
                 ')' if !self.in_single_quotes && !self.in_double_quotes => {
                     return Some(Token::RightParen);
+                }
+                c if c.is_ascii_digit() && (!self.in_single_quotes && !self.in_double_quotes) => {
+                    return Some(Token::NumberLiteral(c.to_digit(10)?));
                 }
                 '\'' if !self.in_double_quotes => self.in_single_quotes = !self.in_single_quotes,
                 '"' if !self.in_single_quotes => {

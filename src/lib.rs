@@ -47,9 +47,15 @@ pub struct Shell {
     path_executables: Vec<DirEntry>,
     last_status: Option<ExitStatus>,
     pub autocomplete_options: Trie,
-    bg_jobs: Vec<JoinHandle<io::Result<ExitStatus>>>,
-    bg_job_remove_channel: UnboundedReceiver<tokio::task::Id>, // store PID
+
+    bg_jobs: Vec<(JoinHandle<io::Result<ExitStatus>>, Option<u32>)>,
+    bg_job_remove_channel: UnboundedReceiver<tokio::task::Id>,
     _bg_job_remove_txs: UnboundedSender<tokio::task::Id>,
+
+    /// Receiving part of channel used to set process id of spawned process
+    bg_job_set_pid: UnboundedReceiver<(tokio::task::Id, Option<u32>)>,
+    /// Sending part of channel used to set process id of spawned process
+    _bg_job_set_pid_txs: UnboundedSender<(tokio::task::Id, Option<u32>)>,
 }
 
 impl Shell {
@@ -67,6 +73,7 @@ impl Shell {
         }
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (pid_tx, pid_rx) = tokio::sync::mpsc::unbounded_channel();
 
         Self {
             path,
@@ -76,6 +83,8 @@ impl Shell {
             bg_jobs: vec![],
             bg_job_remove_channel: rx,
             _bg_job_remove_txs: tx,
+            bg_job_set_pid: pid_rx,
+            _bg_job_set_pid_txs: pid_tx,
         }
     }
 
@@ -90,6 +99,9 @@ impl Shell {
             select! {
                 Some(job_id) = self.bg_job_remove_channel.recv() => {
                     self.handle_bg_job_completition(job_id).await?;
+                },
+                Some((job_id, pid)) = self.bg_job_set_pid.recv() => {
+                    self.update_job_pid(job_id, pid);
                 },
                 signal = readline.read(&mut input) => {
 
@@ -168,13 +180,20 @@ impl Shell {
             CommandKind::ExternalCommand { .. } => {
                 if command.is_bg_job {
                     let channel = self._bg_job_remove_txs.clone();
-                    let job =
-                        execute_external_command(self.path.clone(), command, None, Some(channel));
+                    let pid_channel = self._bg_job_set_pid_txs.clone();
+                    let job = execute_external_command(
+                        self.path.clone(),
+                        command,
+                        None,
+                        Some(channel),
+                        Some(pid_channel),
+                    );
                     let handle = tokio::spawn(job);
-                    self.bg_jobs.push(handle);
+                    self.bg_jobs.push((handle, None));
                 } else {
                     let exit_status =
-                        execute_external_command(self.path.clone(), command, None, None).await?;
+                        execute_external_command(self.path.clone(), command, None, None, None)
+                            .await?;
                     self.last_status = Some(exit_status);
                 }
             }
@@ -193,6 +212,9 @@ impl Shell {
             }
             CommandKind::History => {
                 self.dump_history(&mut out).await?;
+            }
+            CommandKind::Jobs => {
+                self.show_jobs(&mut out).await?;
             }
         }
 
@@ -217,11 +239,32 @@ impl Shell {
         if let Some(job) = self
             .bg_jobs
             .iter()
-            .position(|id| id.id() == job_id)
+            .position(|id| id.0.id() == job_id)
             .map(|pos| self.bg_jobs.remove(pos))
         {
-            self.last_status = Some(job.await??); // Probably should not propagate
+            self.last_status = Some(job.0.await??); // Probably should not propagate
         }
+        Ok(())
+    }
+
+    fn update_job_pid(&mut self, job_id: tokio::task::Id, pid: Option<u32>) {
+        if let Some(job) = self
+            .bg_jobs
+            .iter()
+            .position(|job| job.0.id() == job_id)
+            .and_then(|job_id| self.bg_jobs.get_mut(job_id))
+        {
+            job.1 = pid;
+        }
+    }
+
+    async fn show_jobs<S: AsyncWrite + Unpin>(&self, out: &mut S) -> io::Result<()> {
+        out.write_all(b"Job\tGroup\n").await?;
+        for job in &self.bg_jobs {
+            out.write_all(format!("{}\t{}\n", job.0.id(), job.1.unwrap_or(0)).as_bytes())
+                .await?;
+        }
+        out.flush().await?;
         Ok(())
     }
 }
@@ -368,6 +411,7 @@ fn execute_external_command<'a>(
     command: Command,
     pipe_input: Option<Vec<u8>>,
     channel: Option<UnboundedSender<tokio::task::Id>>,
+    pid_channel: Option<UnboundedSender<(tokio::task::Id, Option<u32>)>>,
 ) -> Pin<Box<dyn Future<Output = io::Result<ExitStatus>> + 'a + Send>> {
     Box::pin(async move {
         let CommandKind::ExternalCommand { name, input } = command.kind else {
@@ -409,6 +453,10 @@ fn execute_external_command<'a>(
             .stderr(stderr)
             .spawn()?;
 
+        if let Some(pid_channel) = pid_channel {
+            let _ = pid_channel.send((tokio::task::id(), child.id()));
+        }
+
         if let Some(pipe_input) = pipe_input {
             if let Some(ref mut stdin) = child.stdin {
                 stdin.write_all(&pipe_input).await?;
@@ -418,8 +466,14 @@ fn execute_external_command<'a>(
         let status = if let Some(sub) = command.pipe_to {
             if let CommandKind::ExternalCommand { .. } = sub.kind {
                 let output = child.wait_with_output().await?;
-                execute_external_command(path.clone(), *sub.clone(), Some(output.stdout), None)
-                    .await?;
+                execute_external_command(
+                    path.clone(),
+                    *sub.clone(),
+                    Some(output.stdout),
+                    None,
+                    None,
+                )
+                .await?;
                 output.status
             } else {
                 ExitStatus::default()

@@ -25,6 +25,7 @@ use tokio::{
     process::Command as SysCommand,
     task,
 };
+use tokio_util::sync::CancellationToken;
 
 pub mod autocomplete;
 pub mod command;
@@ -41,6 +42,8 @@ macro_rules! debug {
     };
 }
 
+pub type Job = (JoinHandle<Option<io::Result<ExitStatus>>>, Option<u32>);
+
 #[derive(Debug)]
 pub struct Shell {
     path: String,
@@ -48,7 +51,7 @@ pub struct Shell {
     last_status: Option<ExitStatus>,
     pub autocomplete_options: Trie,
 
-    bg_jobs: Vec<(JoinHandle<io::Result<ExitStatus>>, Option<u32>)>,
+    bg_jobs: Vec<Job>,
     bg_job_remove_channel: UnboundedReceiver<tokio::task::Id>,
     _bg_job_remove_txs: UnboundedSender<tokio::task::Id>,
 
@@ -56,6 +59,7 @@ pub struct Shell {
     bg_job_set_pid: UnboundedReceiver<(tokio::task::Id, Option<u32>)>,
     /// Sending part of channel used to set process id of spawned process
     _bg_job_set_pid_txs: UnboundedSender<(tokio::task::Id, Option<u32>)>,
+    global_cancelation_token: CancellationToken,
 }
 
 impl Shell {
@@ -85,6 +89,7 @@ impl Shell {
             _bg_job_remove_txs: tx,
             bg_job_set_pid: pid_rx,
             _bg_job_set_pid_txs: pid_tx,
+            global_cancelation_token: CancellationToken::new(),
         }
     }
 
@@ -106,6 +111,7 @@ impl Shell {
                 signal = readline.read(&mut input) => {
 
                     if signal? == Signal::CtrlD {
+                        self.global_cancelation_token.cancel();
                         break;
                     }
 
@@ -178,6 +184,7 @@ impl Shell {
         match command.kind {
             CommandKind::Exit { status_code } => exit(status_code),
             CommandKind::ExternalCommand { .. } => {
+                let token = self.global_cancelation_token.clone();
                 if command.is_bg_job {
                     let channel = self._bg_job_remove_txs.clone();
                     let pid_channel = self._bg_job_set_pid_txs.clone();
@@ -188,7 +195,7 @@ impl Shell {
                         Some(channel),
                         Some(pid_channel),
                     );
-                    let handle = tokio::spawn(job);
+                    let handle = tokio::spawn(token.run_until_cancelled_owned(job));
                     self.bg_jobs.push((handle, None));
                 } else {
                     let exit_status =
@@ -216,6 +223,20 @@ impl Shell {
             CommandKind::Jobs => {
                 self.show_jobs(&mut out).await?;
             }
+            CommandKind::Fg(pid) => {
+                let job = self.bg_jobs.iter().find(|job| job.1 == pid);
+                if let Some(job) = job {
+                    self.handle_bg_job_completition(job.0.id()).await?;
+                } else if let Some(job) = self.bg_jobs.first() {
+                    self.handle_bg_job_completition(job.0.id()).await?;
+                } else {
+                    let mut stderr = io::stderr();
+                    stderr
+                        .write_all(b"No jobs where found with given PID\r\n")
+                        .await?;
+                    stderr.flush().await?;
+                }
+            }
         }
 
         Ok(())
@@ -242,7 +263,10 @@ impl Shell {
             .position(|id| id.0.id() == job_id)
             .map(|pos| self.bg_jobs.remove(pos))
         {
-            self.last_status = Some(job.0.await??); // Probably should not propagate
+            let res = job.0.await?;
+            if let Some(status) = res {
+                self.last_status = Some(status?);
+            }
         }
         Ok(())
     }
@@ -423,7 +447,6 @@ fn execute_external_command<'a>(
                 .ok_or(io::Error::other("Can not convert name to string"))?,
         )
         .ok_or(io::Error::other("Can not canonicalize path"))?;
-        disable_raw_mode()?;
         let stdout = if command.pipe_to.is_some() {
             Stdio::piped()
         } else {
@@ -446,6 +469,7 @@ fn execute_external_command<'a>(
         } else {
             Stdio::inherit()
         };
+        disable_raw_mode()?;
         let mut child = SysCommand::new(canonical_name)
             .args(input)
             .stdin(stdin)

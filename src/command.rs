@@ -29,6 +29,7 @@ pub enum CommandKind {
     ExternalCommand { name: OsString, input: Vec<String> },
     History,
     Jobs,
+    Fg(Option<u32>),
 }
 
 impl Default for CommandKind {
@@ -121,6 +122,7 @@ impl Command {
             },
             "history" => History,
             "jobs" => Jobs,
+            "fg" => Fg(args.get(1).map(|pid| pid.parse().unwrap())),
             arg => {
                 let name = OsString::from(arg);
 

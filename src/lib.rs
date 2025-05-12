@@ -8,6 +8,7 @@ use prompt::DirPrompt;
 use readline::constants::{BUILTINS, DOUBLE_QUOTES_ESCAPE, GLOB};
 use readline::signal::Signal;
 use readline::Readline;
+use std::collections::HashMap;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::future::Future;
@@ -17,6 +18,7 @@ use std::pin::Pin;
 use std::process::{exit, ExitStatus, Stdio};
 use tokio::io::{stderr, stdout, AsyncWrite};
 use tokio::select;
+use tokio::sync::mpsc::error::SendError;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tokio::{
@@ -42,7 +44,62 @@ macro_rules! debug {
     };
 }
 
-pub type Job = (JoinHandle<Option<io::Result<ExitStatus>>>, Option<u32>);
+#[derive(Debug)]
+pub(crate) struct Job<R = Option<io::Result<ExitStatus>>> {
+    handle: JoinHandle<R>,
+    pid: Option<u32>,
+}
+
+impl<R> Job<R> {
+    pub fn new(handle: JoinHandle<R>) -> Self {
+        Self { handle, pid: None }
+    }
+}
+
+pub(crate) type JobList = std::collections::HashMap<tokio::task::Id, Job>;
+
+#[derive(Debug)]
+pub(crate) struct JobContext {
+    bg_job_remove_tx: UnboundedSender<tokio::task::Id>,
+    bg_job_set_pid_tx: UnboundedSender<(tokio::task::Id, Option<u32>)>,
+    global_cancelation_token: CancellationToken,
+}
+
+impl JobContext {
+    pub fn new(
+        remove_tx: UnboundedSender<tokio::task::Id>,
+        set_pid_tx: UnboundedSender<(tokio::task::Id, Option<u32>)>,
+        token: CancellationToken,
+    ) -> Self {
+        Self {
+            bg_job_remove_tx: remove_tx,
+            bg_job_set_pid_tx: set_pid_tx,
+            global_cancelation_token: token,
+        }
+    }
+
+    pub fn set_pid(
+        &self,
+        job_id: tokio::task::Id,
+        pid: Option<u32>,
+    ) -> Result<(), SendError<(tokio::task::Id, Option<u32>)>> {
+        self.bg_job_set_pid_tx.send((job_id, pid))
+    }
+
+    pub fn remove(&self, job_id: tokio::task::Id) -> Result<(), SendError<tokio::task::Id>> {
+        self.bg_job_remove_tx.send(job_id)
+    }
+}
+
+impl Clone for JobContext {
+    fn clone(&self) -> Self {
+        Self {
+            bg_job_remove_tx: self.bg_job_remove_tx.clone(),
+            bg_job_set_pid_tx: self.bg_job_set_pid_tx.clone(),
+            global_cancelation_token: self.global_cancelation_token.clone(),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct Shell {
@@ -51,21 +108,18 @@ pub struct Shell {
     last_status: Option<ExitStatus>,
     pub autocomplete_options: Trie,
 
-    bg_jobs: Vec<Job>,
+    bg_jobs: JobList,
     bg_job_remove_channel: UnboundedReceiver<tokio::task::Id>,
-    _bg_job_remove_txs: UnboundedSender<tokio::task::Id>,
-
     /// Receiving part of channel used to set process id of spawned process
     bg_job_set_pid: UnboundedReceiver<(tokio::task::Id, Option<u32>)>,
-    /// Sending part of channel used to set process id of spawned process
-    _bg_job_set_pid_txs: UnboundedSender<(tokio::task::Id, Option<u32>)>,
-    global_cancelation_token: CancellationToken,
+
+    job_context: JobContext,
 }
 
 impl Shell {
     pub async fn new() -> Self {
         let path = std::env::var("PATH").unwrap_or_else(|_| "".to_string());
-        set_color_envs();
+        set_shell_envs();
         let path_executables = populate_path_executables(&path).await;
 
         let mut autocomplete_options = Trie::new();
@@ -78,18 +132,18 @@ impl Shell {
 
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (pid_tx, pid_rx) = tokio::sync::mpsc::unbounded_channel();
+        let cancellation_token = CancellationToken::new();
+        let context = JobContext::new(tx, pid_tx, cancellation_token);
 
         Self {
             path,
             path_executables,
             last_status: None,
             autocomplete_options,
-            bg_jobs: vec![],
+            bg_jobs: HashMap::new(),
             bg_job_remove_channel: rx,
-            _bg_job_remove_txs: tx,
             bg_job_set_pid: pid_rx,
-            _bg_job_set_pid_txs: pid_tx,
-            global_cancelation_token: CancellationToken::new(),
+            job_context: context,
         }
     }
 
@@ -111,7 +165,7 @@ impl Shell {
                 signal = readline.read(&mut input) => {
 
                     if signal? == Signal::CtrlD {
-                        self.global_cancelation_token.cancel();
+                        self.job_context.global_cancelation_token.cancel();
                         break;
                     }
 
@@ -184,23 +238,20 @@ impl Shell {
         match command.kind {
             CommandKind::Exit { status_code } => exit(status_code),
             CommandKind::ExternalCommand { .. } => {
-                let token = self.global_cancelation_token.clone();
+                let context = self.job_context.clone();
                 if command.is_bg_job {
-                    let channel = self._bg_job_remove_txs.clone();
-                    let pid_channel = self._bg_job_set_pid_txs.clone();
-                    let job = execute_external_command(
-                        self.path.clone(),
-                        command,
-                        None,
-                        Some(channel),
-                        Some(pid_channel),
+                    let job =
+                        execute_external_command(self.path.clone(), command, None, Some(context));
+                    let handle = tokio::spawn(
+                        self.job_context
+                            .global_cancelation_token
+                            .clone()
+                            .run_until_cancelled_owned(job),
                     );
-                    let handle = tokio::spawn(token.run_until_cancelled_owned(job));
-                    self.bg_jobs.push((handle, None));
+                    self.bg_jobs.insert(handle.id(), Job::new(handle));
                 } else {
                     let exit_status =
-                        execute_external_command(self.path.clone(), command, None, None, None)
-                            .await?;
+                        execute_external_command(self.path.clone(), command, None, None).await?;
                     self.last_status = Some(exit_status);
                 }
             }
@@ -224,11 +275,12 @@ impl Shell {
                 self.show_jobs(&mut out).await?;
             }
             CommandKind::Fg(pid) => {
-                let job = self.bg_jobs.iter().find(|job| job.1 == pid);
-                if let Some(job) = job {
-                    self.handle_bg_job_completition(job.0.id()).await?;
-                } else if let Some(job) = self.bg_jobs.first() {
-                    self.handle_bg_job_completition(job.0.id()).await?;
+                if let Some(job) = self.bg_jobs.values().find(|job| job.pid == pid) {
+                    self.handle_bg_job_completition(job.handle.id()).await?;
+                } else if let Some(job) = self.bg_jobs.iter().next() {
+                    // TODO: this is not
+                    // optiomal, as HashMap iterates "randomly" over it's items.
+                    self.handle_bg_job_completition(*job.0).await?;
                 } else {
                     let mut stderr = io::stderr();
                     stderr
@@ -257,13 +309,8 @@ impl Shell {
     }
 
     async fn handle_bg_job_completition(&mut self, job_id: tokio::task::Id) -> io::Result<()> {
-        if let Some(job) = self
-            .bg_jobs
-            .iter()
-            .position(|id| id.0.id() == job_id)
-            .map(|pos| self.bg_jobs.remove(pos))
-        {
-            let res = job.0.await?;
+        if let Some(job) = self.bg_jobs.remove(&job_id) {
+            let res = job.handle.await?;
             if let Some(status) = res {
                 self.last_status = Some(status?);
             }
@@ -272,20 +319,15 @@ impl Shell {
     }
 
     fn update_job_pid(&mut self, job_id: tokio::task::Id, pid: Option<u32>) {
-        if let Some(job) = self
-            .bg_jobs
-            .iter()
-            .position(|job| job.0.id() == job_id)
-            .and_then(|job_id| self.bg_jobs.get_mut(job_id))
-        {
-            job.1 = pid;
+        if let Some(job) = self.bg_jobs.get_mut(&job_id) {
+            job.pid = pid;
         }
     }
 
     async fn show_jobs<S: AsyncWrite + Unpin>(&self, out: &mut S) -> io::Result<()> {
         out.write_all(b"Job\tGroup\n").await?;
         for job in &self.bg_jobs {
-            out.write_all(format!("{}\t{}\n", job.0.id(), job.1.unwrap_or(0)).as_bytes())
+            out.write_all(format!("{}\t{}\n", job.0, job.1.pid.unwrap_or(0)).as_bytes())
                 .await?;
         }
         out.flush().await?;
@@ -293,7 +335,7 @@ impl Shell {
     }
 }
 
-fn set_color_envs() {
+fn set_shell_envs() {
     std::env::set_var("COLORTERM", "truecolor");
     std::env::set_var("CLICOLOR", "truecolor");
     std::env::set_var("CLICOLOR_FORCE", "1");
@@ -434,8 +476,7 @@ fn execute_external_command<'a>(
     path: String,
     command: Command,
     pipe_input: Option<Vec<u8>>,
-    channel: Option<UnboundedSender<tokio::task::Id>>,
-    pid_channel: Option<UnboundedSender<(tokio::task::Id, Option<u32>)>>,
+    context: Option<JobContext>,
 ) -> Pin<Box<dyn Future<Output = io::Result<ExitStatus>> + 'a + Send>> {
     Box::pin(async move {
         let CommandKind::ExternalCommand { name, input } = command.kind else {
@@ -477,8 +518,8 @@ fn execute_external_command<'a>(
             .stderr(stderr)
             .spawn()?;
 
-        if let Some(pid_channel) = pid_channel {
-            let _ = pid_channel.send((tokio::task::id(), child.id()));
+        if let Some(ref context) = context {
+            let _ = context.set_pid(tokio::task::id(), child.id());
         }
 
         if let Some(pipe_input) = pipe_input {
@@ -494,8 +535,7 @@ fn execute_external_command<'a>(
                     path.clone(),
                     *sub.clone(),
                     Some(output.stdout),
-                    None,
-                    None,
+                    context.clone(),
                 )
                 .await?;
                 output.status
@@ -507,8 +547,8 @@ fn execute_external_command<'a>(
         };
         enable_raw_mode()?;
 
-        if let Some(channel) = channel {
-            let _ = channel.send(tokio::task::id());
+        if let Some(context) = context {
+            let _ = context.remove(tokio::task::id());
         }
 
         Ok(status)

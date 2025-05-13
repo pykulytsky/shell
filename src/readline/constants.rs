@@ -10,6 +10,7 @@ pub const PIPE: &str = "|";
 
 pub const CTRL_C: u8 = 3;
 pub const CTRL_D: u8 = 4;
+pub const CTRL_Z: u8 = 26;
 pub const BACKSPACE: u8 = 127;
 pub const CTRL: u8 = 17;
 pub const ESC: u8 = 27;
@@ -26,7 +27,7 @@ pub const CTRL_LEFT_ARROW: [u8; 2] = [51, 68];
 pub const CTRL_RIGHT_ARROW: [u8; 2] = [51, 67];
 pub const DECSM: u8 = b'[';
 
-pub const SHOULD_NOT_REDRAW_PROMPT: &[u8] = &[BACKSPACE, ESC];
+pub const SHOULD_NOT_REDRAW_PROMPT: &[u8] = &[BACKSPACE, ESC, CTRL_Z];
 
 pub const BUILTINS: &[&str] = &["cd", "exit", "echo", "type", "pwd", "history"];
 

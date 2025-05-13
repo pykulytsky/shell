@@ -14,7 +14,7 @@ pub enum HistoryDirection {
 }
 
 use constants::{
-    DECSM, DOWN_ARROW, KEY_TIMEOUT_DURATION, NEWLINE, OPTION_KEY, RETURN, TAB, UP_ARROW,
+    CTRL_Z, DECSM, DOWN_ARROW, KEY_TIMEOUT_DURATION, NEWLINE, OPTION_KEY, RETURN, TAB, UP_ARROW,
 };
 use crossterm::{
     cursor::{MoveLeft, MoveRight},
@@ -125,9 +125,9 @@ impl<P: Prompt> Readline<P> {
     }
 
     pub async fn read(&mut self, input: &mut String) -> io::Result<Signal> {
-        enable_raw_mode()?;
         let signal;
 
+        enable_raw_mode()?;
         loop {
             if let Some(prompt) = &self.prompt {
                 if self.buffer.is_empty()
@@ -186,6 +186,9 @@ impl<P: Prompt> Readline<P> {
                 }
                 TAB => {
                     self.handle_autocomplete().await?;
+                }
+                CTRL_Z => {
+                    return Ok(Some(Signal::CtrlZ));
                 }
                 _ => {
                     self.handle_char(byte).await?;

@@ -4,6 +4,7 @@ use autocomplete::Trie;
 use command::{Command, CommandKind, SinkKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use glob::glob;
+use jobs::{override_sigtstp, Job, JobContext, JobList};
 use prompt::DirPrompt;
 use readline::constants::{BUILTINS, DOUBLE_QUOTES_ESCAPE, GLOB};
 use readline::signal::Signal;
@@ -18,9 +19,8 @@ use std::pin::Pin;
 use std::process::{exit, ExitStatus, Stdio};
 use tokio::io::{stderr, stdout, AsyncWrite};
 use tokio::select;
-use tokio::sync::mpsc::error::SendError;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tokio::task::JoinHandle;
+use tokio::signal::unix::SignalKind;
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::{
     fs::{read_dir, DirEntry},
     io::{self, AsyncWriteExt},
@@ -31,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 
 pub mod autocomplete;
 pub mod command;
+mod jobs;
 pub mod prompt;
 pub mod readline;
 mod tokenizer;
@@ -42,63 +43,6 @@ macro_rules! debug {
         println!($($input)*);
         enable_raw_mode().unwrap();
     };
-}
-
-#[derive(Debug)]
-pub(crate) struct Job<R = Option<io::Result<ExitStatus>>> {
-    handle: JoinHandle<R>,
-    pid: Option<u32>,
-}
-
-impl<R> Job<R> {
-    pub fn new(handle: JoinHandle<R>) -> Self {
-        Self { handle, pid: None }
-    }
-}
-
-pub(crate) type JobList = std::collections::HashMap<tokio::task::Id, Job>;
-
-#[derive(Debug)]
-pub(crate) struct JobContext {
-    bg_job_remove_tx: UnboundedSender<tokio::task::Id>,
-    bg_job_set_pid_tx: UnboundedSender<(tokio::task::Id, Option<u32>)>,
-    global_cancelation_token: CancellationToken,
-}
-
-impl JobContext {
-    pub fn new(
-        remove_tx: UnboundedSender<tokio::task::Id>,
-        set_pid_tx: UnboundedSender<(tokio::task::Id, Option<u32>)>,
-        token: CancellationToken,
-    ) -> Self {
-        Self {
-            bg_job_remove_tx: remove_tx,
-            bg_job_set_pid_tx: set_pid_tx,
-            global_cancelation_token: token,
-        }
-    }
-
-    pub fn set_pid(
-        &self,
-        job_id: tokio::task::Id,
-        pid: Option<u32>,
-    ) -> Result<(), SendError<(tokio::task::Id, Option<u32>)>> {
-        self.bg_job_set_pid_tx.send((job_id, pid))
-    }
-
-    pub fn remove(&self, job_id: tokio::task::Id) -> Result<(), SendError<tokio::task::Id>> {
-        self.bg_job_remove_tx.send(job_id)
-    }
-}
-
-impl Clone for JobContext {
-    fn clone(&self) -> Self {
-        Self {
-            bg_job_remove_tx: self.bg_job_remove_tx.clone(),
-            bg_job_set_pid_tx: self.bg_job_set_pid_tx.clone(),
-            global_cancelation_token: self.global_cancelation_token.clone(),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -154,6 +98,13 @@ impl Shell {
         readline.vim_mode_enabled = true;
         readline.autocomplete_options = self.autocomplete_options.clone();
         let mut input = String::new();
+
+        unsafe {
+            libc::signal(libc::SIGTSTP, libc::SIG_IGN);
+            override_sigtstp();
+        }
+
+        let mut sigstp = tokio::signal::unix::signal(SignalKind::from_raw(libc::SIGTSTP)).unwrap();
         loop {
             select! {
                 Some(job_id) = self.bg_job_remove_channel.recv() => {
@@ -162,13 +113,27 @@ impl Shell {
                 Some((job_id, pid)) = self.bg_job_set_pid.recv() => {
                     self.update_job_pid(job_id, pid);
                 },
+                _ = sigstp.recv() => {
+                    // ignore for now
+                }
                 signal = readline.read(&mut input) => {
-
-                    if signal? == Signal::CtrlD {
-                        self.job_context.global_cancelation_token.cancel();
-                        break;
+                    match signal? {
+                        Signal::CtrlZ => {
+                            crossterm::terminal::disable_raw_mode().ok();
+                            unsafe {
+                                libc::kill(libc::getpid(), libc::SIGTSTP);
+                            }
+                            crossterm::terminal::enable_raw_mode().ok();
+                            continue;
+                        },
+                        Signal::CtrlD => {
+                            self.job_context.global_cancelation_token.cancel();
+                            // All concurrent futures in this select is cancellation safe, so we are
+                            // free to call a break here.
+                            break;
+                        }
+                        _ => {}
                     }
-
                     if !input.is_empty() {
                         match Command::parse(input.trim_start()).await {
                             Ok(command) => self.execute(command).await?,
@@ -176,9 +141,9 @@ impl Shell {
                         }
                         input.clear();
                     }
-                }
-
+                },
             }
+
             if let Some(status) = self.last_status.and_then(|s| s.code()) {
                 std::env::set_var("status", status.to_string());
             }
@@ -488,6 +453,7 @@ fn execute_external_command<'a>(
                 .ok_or(io::Error::other("Can not convert name to string"))?,
         )
         .ok_or(io::Error::other("Can not canonicalize path"))?;
+
         let stdout = if command.pipe_to.is_some() {
             Stdio::piped()
         } else {
@@ -510,7 +476,9 @@ fn execute_external_command<'a>(
         } else {
             Stdio::inherit()
         };
+
         disable_raw_mode()?;
+
         let mut child = SysCommand::new(canonical_name)
             .args(input)
             .stdin(stdin)
@@ -545,6 +513,7 @@ fn execute_external_command<'a>(
         } else {
             child.wait().await?
         };
+
         enable_raw_mode()?;
 
         if let Some(context) = context {

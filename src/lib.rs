@@ -52,6 +52,7 @@ pub struct Shell {
     last_status: Option<ExitStatus>,
     pub autocomplete_options: Trie,
 
+    fg_job: Option<tokio::task::JoinHandle<io::Result<ExitStatus>>>,
     bg_jobs: JobList,
     bg_job_remove_channel: UnboundedReceiver<tokio::task::Id>,
     /// Receiving part of channel used to set process id of spawned process
@@ -84,6 +85,7 @@ impl Shell {
             path_executables,
             last_status: None,
             autocomplete_options,
+            fg_job: None,
             bg_jobs: HashMap::new(),
             bg_job_remove_channel: rx,
             bg_job_set_pid: pid_rx,
@@ -116,7 +118,20 @@ impl Shell {
                 _ = sigstp.recv() => {
                     // ignore for now
                 }
-                signal = readline.read(&mut input) => {
+                fg_job_result = async {
+                    if let Some(handle) = self.fg_job.as_mut() {
+                        Some(handle.await)
+                    } else {
+                        None
+                    }
+                }, if self.fg_job.is_some() => {
+                    if let Some(fg_job_result) = fg_job_result {
+                        self.last_status = Some(fg_job_result??);
+                    }
+                    self.fg_job = None;
+
+                }
+                signal = readline.read(&mut input), if self.fg_job.is_none() => {
                     match signal? {
                         Signal::CtrlZ => {
                             crossterm::terminal::disable_raw_mode().ok();
@@ -215,9 +230,11 @@ impl Shell {
                     );
                     self.bg_jobs.insert(handle.id(), Job::new(handle));
                 } else {
-                    let exit_status =
-                        execute_external_command(self.path.clone(), command, None, None).await?;
-                    self.last_status = Some(exit_status);
+                    let job = execute_external_command(self.path.clone(), command, None, None);
+                    self.fg_job = Some(tokio::spawn(job));
+                    // let exit_status =
+                    //     execute_external_command(self.path.clone(), command, None, None).await?;
+                    // self.last_status = Some(exit_status);
                 }
             }
             CommandKind::Cd { path } => {
@@ -441,7 +458,7 @@ fn execute_external_command<'a>(
     path: String,
     command: Command,
     pipe_input: Option<Vec<u8>>,
-    context: Option<JobContext>,
+    bg_context: Option<JobContext>,
 ) -> Pin<Box<dyn Future<Output = io::Result<ExitStatus>> + 'a + Send>> {
     Box::pin(async move {
         let CommandKind::ExternalCommand { name, input } = command.kind else {
@@ -486,7 +503,7 @@ fn execute_external_command<'a>(
             .stderr(stderr)
             .spawn()?;
 
-        if let Some(ref context) = context {
+        if let Some(ref context) = bg_context {
             let _ = context.set_pid(tokio::task::id(), child.id());
         }
 
@@ -503,7 +520,7 @@ fn execute_external_command<'a>(
                     path.clone(),
                     *sub.clone(),
                     Some(output.stdout),
-                    context.clone(),
+                    bg_context.clone(),
                 )
                 .await?;
                 output.status
@@ -516,7 +533,7 @@ fn execute_external_command<'a>(
 
         enable_raw_mode()?;
 
-        if let Some(context) = context {
+        if let Some(context) = bg_context {
             let _ = context.remove(tokio::task::id());
         }
 

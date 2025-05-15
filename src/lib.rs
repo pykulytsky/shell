@@ -3,7 +3,7 @@
 use autocomplete::Trie;
 use command::{Command, CommandKind, SinkKind};
 use context::{BgContext, Context, FgContext, Job, JobList, JobStatus};
-use crossterm::terminal::disable_raw_mode;
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use glob::glob;
 use prompt::DirPrompt;
 use readline::constants::{BUILTINS, DOUBLE_QUOTES_ESCAPE, GLOB};
@@ -121,7 +121,7 @@ impl Shell {
                 enable_cbreak_mode()?;
             } else {
                 readline.prompt = Some(DirPrompt);
-                enable_cbreak_mode()?;
+                enable_raw_mode()?;
             }
             select! {
                 Some(job_id) = self.bg_job_remove_channel.recv() => {

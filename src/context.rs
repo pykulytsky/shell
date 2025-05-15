@@ -30,11 +30,8 @@ impl<R> Job<R> {
 pub(crate) type JobList = std::collections::HashMap<tokio::task::Id, Job>;
 
 pub trait Context {
-    fn set_pid(
-        &self,
-        job_id: tokio::task::Id,
-        pid: Option<u32>,
-    ) -> Result<(), SendError<(tokio::task::Id, Option<u32>)>>;
+    type Result;
+    fn set_pid(&self, job_id: tokio::task::Id, pid: Option<u32>) -> Self::Result;
 
     fn remove(&self, job_id: tokio::task::Id) -> Result<(), SendError<tokio::task::Id>>;
 }
@@ -58,11 +55,8 @@ impl BgContext {
 }
 
 impl Context for BgContext {
-    fn set_pid(
-        &self,
-        job_id: tokio::task::Id,
-        pid: Option<u32>,
-    ) -> Result<(), SendError<(tokio::task::Id, Option<u32>)>> {
+    type Result = Result<(), SendError<(tokio::task::Id, Option<u32>)>>;
+    fn set_pid(&self, job_id: tokio::task::Id, pid: Option<u32>) -> Self::Result {
         self.set_pid_tx.send((job_id, pid))
     }
 
@@ -92,14 +86,10 @@ impl FgContext {
 }
 
 impl Context for FgContext {
-    fn set_pid(
-        &self,
-        _job_id: tokio::task::Id,
-        pid: Option<u32>,
-    ) -> Result<(), SendError<(tokio::task::Id, Option<u32>)>> {
+    type Result = ();
+    fn set_pid(&self, _job_id: tokio::task::Id, pid: Option<u32>) -> Self::Result {
         let mut lock = self.pid.lock().unwrap();
         *lock = pid;
-        Ok(())
     }
 
     fn remove(&self, _job_id: tokio::task::Id) -> Result<(), SendError<tokio::task::Id>> {

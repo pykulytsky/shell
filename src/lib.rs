@@ -229,7 +229,7 @@ impl Shell {
             CommandKind::Exit { status_code } => exit(status_code),
             CommandKind::ExternalCommand { .. } => {
                 if command.is_bg_job {
-                let context = self.bg_context.clone();
+                    let context = self.bg_context.clone();
                     let job = execute_external_command(self.path.clone(), command, None, context);
                     let handle = tokio::spawn(
                         self.cancellation_token

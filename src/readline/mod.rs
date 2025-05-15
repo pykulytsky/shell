@@ -18,8 +18,8 @@ use constants::{
 };
 use crossterm::{
     cursor::{MoveLeft, MoveRight},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
+    execute, queue,
+    terminal::{disable_raw_mode, enable_raw_mode},
 };
 use std::collections::VecDeque;
 use tokio::{
@@ -548,27 +548,29 @@ impl<P: Prompt> Readline<P> {
 
     async fn handle_backspace(&mut self) -> io::Result<()> {
         self.history_cursor = None;
-        if self.input_cursor != 0 {
-            self.input_cursor -= 1;
-            self.buffer.remove(self.input_cursor);
-            if self.input_cursor == self.buffer.len() {
-                self.stdout.write_all(b"\x08 \x08").await?;
-            } else {
-                let mut temp_buf = vec![];
-                execute!(temp_buf, Clear(ClearType::CurrentLine))?;
-                self.stdout.write_all(&temp_buf).await?;
-                self.stdout.write_all(b"\r").await?;
-                if let Some(prompt) = &self.prompt {
-                    prompt.draw(&mut self.stdout).await?;
-                }
-                self.stdout.write_all(&self.buffer).await?;
-                temp_buf.clear();
-                execute!(
-                    temp_buf,
-                    MoveLeft((self.buffer.len() - self.input_cursor) as u16)
-                )?;
-                self.stdout.write_all(&temp_buf).await?;
-            }
+        if self.input_cursor == 0 {
+            return Ok(());
+        }
+
+        self.input_cursor -= 1;
+        self.buffer.remove(self.input_cursor);
+
+        let mut temp_buf = Vec::with_capacity(128);
+
+        if self.input_cursor == self.buffer.len() {
+            self.stdout.write_all(b"\x08 \x08").await?;
+        } else {
+            queue!(temp_buf, MoveLeft(1))?;
+
+            let rest = &self.buffer[self.input_cursor..];
+            temp_buf.extend_from_slice(rest);
+
+            temp_buf.push(b' ');
+
+            let move_left = rest.len() + 1;
+            queue!(temp_buf, MoveLeft(move_left as u16))?;
+
+            self.stdout.write_all(&temp_buf).await?;
         }
         self.stdout.flush().await?;
 
@@ -579,18 +581,15 @@ impl<P: Prompt> Readline<P> {
         if !self.buffer.is_empty() && self.input_cursor != self.buffer.len() {
             self.buffer.insert(self.input_cursor, byte);
             let mut temp_buf = vec![];
-            execute!(temp_buf, Clear(ClearType::CurrentLine))?;
-            self.stdout.write_all(&temp_buf).await?;
-            self.stdout.write_all(b"\r").await?;
-            if let Some(prompt) = &self.prompt {
-                prompt.draw(&mut self.stdout).await?;
+            let rest = &self.buffer[self.input_cursor..];
+
+            temp_buf.extend_from_slice(rest);
+
+            let move_left = rest.len() - 1;
+            if move_left > 0 {
+                queue!(temp_buf, MoveLeft(move_left as u16))?;
             }
-            self.stdout.write_all(&self.buffer).await?;
-            temp_buf.clear();
-            execute!(
-                temp_buf,
-                MoveLeft((self.buffer.len() - self.input_cursor - 1) as u16)
-            )?;
+
             self.stdout.write_all(&temp_buf).await?;
         } else {
             self.buffer.push(byte);
@@ -663,32 +662,31 @@ impl<P: Prompt> Readline<P> {
         enable_raw_mode()?;
         if self.input_cursor == 0 {
             return Ok(());
-        };
+        }
 
-        let prev_space = self
+        let prev_index = self
             .buffer
-            .get(..self.input_cursor - 1)
-            .and_then(|i| i.iter().rposition(|i| *i == c as u8))
+            .get(..self.input_cursor)
+            .and_then(|s| s.iter().rposition(|&b| b == c as u8))
             .unwrap_or(0);
-        let mut temp_buf = vec![];
-        execute!(temp_buf, Clear(ClearType::CurrentLine))?;
+
+        let from = if prev_index == 0 { 0 } else { prev_index + 1 };
+        let deleted_len = self.input_cursor - from;
+
+        self.buffer.drain(from..self.input_cursor);
+        self.input_cursor = from;
+
+        let mut temp_buf = Vec::with_capacity(128);
+
+        queue!(temp_buf, MoveLeft(deleted_len as u16))?;
+
+        let rest = &self.buffer[self.input_cursor..];
+        temp_buf.extend_from_slice(rest);
+        temp_buf.extend_from_slice(&vec![b' '; deleted_len]);
+        let move_left = rest.len() + deleted_len;
+        queue!(temp_buf, MoveLeft(move_left as u16))?;
+
         self.stdout.write_all(&temp_buf).await?;
-        self.stdout.write_all(b"\r").await?;
-        if let Some(prompt) = &self.prompt {
-            prompt.draw(&mut self.stdout).await?;
-        }
-        let from = if prev_space == 0 { 0 } else { prev_space + 1 };
-        let deleted = self.buffer.drain(from..self.input_cursor).len();
-        self.input_cursor -= deleted;
-        self.stdout.write_all(&self.buffer).await?;
-        if self.input_cursor != self.buffer.len() {
-            temp_buf.clear();
-            execute!(
-                temp_buf,
-                MoveLeft((self.buffer.len() - self.input_cursor) as u16)
-            )?;
-            self.stdout.write_all(&temp_buf).await?;
-        }
         self.stdout.flush().await?;
         disable_raw_mode()?;
         Ok(())
@@ -704,33 +702,32 @@ impl<P: Prompt> Readline<P> {
             return Ok(());
         }
 
-        let next_space = self
+        let rel_pos = self
             .buffer
             .get(self.input_cursor + 1..)
-            .and_then(|i| i.iter().position(|i| *i == c as u8))
-            .unwrap_or(0);
-        let mut temp_buf = vec![];
-        execute!(temp_buf, Clear(ClearType::CurrentLine))?;
-        self.stdout.write_all(&temp_buf).await?;
-        self.stdout.write_all(b"\r").await?;
-        if let Some(prompt) = &self.prompt {
-            prompt.draw(&mut self.stdout).await?;
-        }
-        let to = if next_space == 0 {
-            self.buffer.len()
-        } else {
-            next_space + 1 + self.input_cursor
+            .and_then(|s| s.iter().position(|&b| b == c as u8))
+            .map(|i| i + 1); // +1 to include the matched character
+
+        let to = match rel_pos {
+            Some(rel) => self.input_cursor + rel,
+            None => self.buffer.len(),
         };
+
+        let deleted_len = to - self.input_cursor;
+
         self.buffer.drain(self.input_cursor..to);
-        self.stdout.write_all(&self.buffer).await?;
-        if self.input_cursor != self.buffer.len() {
-            temp_buf.clear();
-            execute!(
-                temp_buf,
-                MoveLeft((self.buffer.len() - self.input_cursor) as u16)
-            )?;
-            self.stdout.write_all(&temp_buf).await?;
-        }
+
+        let mut temp_buf = Vec::with_capacity(128);
+
+        let rest = &self.buffer[self.input_cursor..];
+        temp_buf.extend_from_slice(rest);
+
+        temp_buf.extend_from_slice(&vec![b' '; deleted_len]);
+
+        let move_left = rest.len() + deleted_len;
+        queue!(temp_buf, MoveLeft(move_left as u16))?;
+
+        self.stdout.write_all(&temp_buf).await?;
         self.stdout.flush().await?;
         disable_raw_mode()?;
         Ok(())
@@ -773,42 +770,49 @@ impl<P: Prompt> Readline<P> {
         let Some((left_delim, right_delim)) = get_matching_delimiters(del) else {
             return Ok(());
         };
+
         let Some(left_delim_pos) = self
             .buffer
-            .get(..self.input_cursor - 1)
-            .and_then(|i| i.iter().rposition(|i| *i == left_delim as u8))
+            .get(..self.input_cursor)
+            .and_then(|s| s.iter().rposition(|&b| b == left_delim as u8))
         else {
             return Ok(());
         };
 
-        let Some(right_delim_pos) = self
+        let Some(right_rel_pos) = self
             .buffer
-            .get(self.input_cursor + 1..)
-            .and_then(|i| i.iter().position(|i| *i == right_delim as u8))
+            .get(self.input_cursor..)
+            .and_then(|s| s.iter().position(|&b| b == right_delim as u8))
         else {
             return Ok(());
         };
 
-        let deleted = self
-            .buffer
-            .drain(left_delim_pos + 1..right_delim_pos + self.input_cursor + 1)
-            .len();
-        let mut temp_buf = vec![];
-        execute!(temp_buf, Clear(ClearType::CurrentLine))?;
+        let right_delim_pos = self.input_cursor + right_rel_pos;
+
+        let from = left_delim_pos + 1;
+        let to = right_delim_pos;
+
+        let deleted_len = to - from;
+
+        self.buffer.drain(from..to);
+        self.input_cursor = from;
+
+        let mut temp_buf = Vec::with_capacity(128);
+
+        queue!(
+            temp_buf,
+            MoveLeft((self.buffer.len() - self.input_cursor) as u16)
+        )?;
+
+        let rest = &self.buffer[self.input_cursor..];
+        temp_buf.extend_from_slice(rest);
+
+        temp_buf.extend_from_slice(&vec![b' '; deleted_len]);
+
+        queue!(temp_buf, MoveLeft((rest.len() + deleted_len) as u16))?;
+
         self.stdout.write_all(&temp_buf).await?;
-        self.stdout.write_all(b"\r").await?;
-        if let Some(prompt) = &self.prompt {
-            prompt.draw(&mut self.stdout).await?;
-        }
-        self.stdout.write_all(&self.buffer).await?;
-
-        if self.input_cursor != self.buffer.len() {
-            temp_buf.clear();
-            execute!(temp_buf, MoveLeft(1))?;
-            self.stdout.write_all(&temp_buf).await?;
-        }
         self.stdout.flush().await?;
-        self.input_cursor -= deleted - 2;
         Ok(())
     }
 }

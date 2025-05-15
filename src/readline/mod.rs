@@ -127,7 +127,7 @@ impl<P: Prompt> Readline<P> {
     pub async fn read(&mut self, input: &mut String) -> io::Result<Signal> {
         let signal;
 
-        enable_raw_mode()?;
+        // enable_raw_mode()?;
         loop {
             if let Some(prompt) = &self.prompt {
                 if self.buffer.is_empty()
@@ -145,7 +145,7 @@ impl<P: Prompt> Readline<P> {
                 None => continue,
             }
         }
-        disable_raw_mode()?;
+        // disable_raw_mode()?;
 
         Ok(signal)
     }
@@ -187,9 +187,9 @@ impl<P: Prompt> Readline<P> {
                 TAB => {
                     self.handle_autocomplete().await?;
                 }
-                CTRL_Z => {
-                    return Ok(Some(Signal::CtrlZ));
-                }
+                CTRL_Z => unsafe {
+                    libc::raise(libc::SIGTSTP);
+                },
                 _ => {
                     self.handle_char(byte).await?;
                 }
@@ -658,7 +658,9 @@ impl<P: Prompt> Readline<P> {
         Ok(())
     }
 
+    // FIXME: rewrite to more efficient implementation
     async fn delete_to_char_prev(&mut self, c: char) -> io::Result<()> {
+        enable_raw_mode()?;
         if self.input_cursor == 0 {
             return Ok(());
         };
@@ -688,6 +690,7 @@ impl<P: Prompt> Readline<P> {
             self.stdout.write_all(&temp_buf).await?;
         }
         self.stdout.flush().await?;
+        disable_raw_mode()?;
         Ok(())
     }
 
@@ -696,6 +699,7 @@ impl<P: Prompt> Readline<P> {
     }
 
     async fn delete_to_char(&mut self, c: char) -> io::Result<()> {
+        enable_raw_mode()?;
         if self.input_cursor >= self.buffer.len() {
             return Ok(());
         }
@@ -728,6 +732,7 @@ impl<P: Prompt> Readline<P> {
             self.stdout.write_all(&temp_buf).await?;
         }
         self.stdout.flush().await?;
+        disable_raw_mode()?;
         Ok(())
     }
 

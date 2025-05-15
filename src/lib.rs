@@ -2,21 +2,21 @@
 
 use autocomplete::Trie;
 use command::{Command, CommandKind, SinkKind};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use context::{BgContext, Context, FgContext, Job, JobList};
+use crossterm::terminal::disable_raw_mode;
 use glob::glob;
-use jobs::{override_sigtstp, Job, JobContext, JobList};
 use prompt::DirPrompt;
 use readline::constants::{BUILTINS, DOUBLE_QUOTES_ESCAPE, GLOB};
 use readline::signal::Signal;
 use readline::Readline;
 use std::collections::HashMap;
-use std::fs::File;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::pin::Pin;
 use std::process::{exit, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
 use tokio::io::{stderr, stdout, AsyncWrite};
 use tokio::select;
 use tokio::signal::unix::SignalKind;
@@ -28,13 +28,15 @@ use tokio::{
     task,
 };
 use tokio_util::sync::CancellationToken;
+use tty::{disable_cbreak_mode, disable_ctrl_z, enable_cbreak_mode};
 
 pub mod autocomplete;
 pub mod command;
-mod jobs;
+mod context;
 pub mod prompt;
 pub mod readline;
 mod tokenizer;
+pub mod tty;
 
 #[macro_export]
 macro_rules! debug {
@@ -45,6 +47,7 @@ macro_rules! debug {
     };
 }
 
+#[allow(unused)]
 #[derive(Debug)]
 pub struct Shell {
     path: String,
@@ -52,13 +55,18 @@ pub struct Shell {
     last_status: Option<ExitStatus>,
     pub autocomplete_options: Trie,
 
-    fg_job: Option<tokio::task::JoinHandle<io::Result<ExitStatus>>>,
+    fg_job: Option<tokio::task::JoinHandle<Option<io::Result<ExitStatus>>>>,
+    fg_job_pid: Arc<Mutex<Option<u32>>>,
+    // to be able to kill or stop process
     bg_jobs: JobList,
     bg_job_remove_channel: UnboundedReceiver<tokio::task::Id>,
     /// Receiving part of channel used to set process id of spawned process
     bg_job_set_pid: UnboundedReceiver<(tokio::task::Id, Option<u32>)>,
 
-    job_context: JobContext,
+    cancellation_token: CancellationToken,
+    bg_context: BgContext,
+
+    sigstp: tokio::signal::unix::Signal,
 }
 
 impl Shell {
@@ -78,7 +86,9 @@ impl Shell {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let (pid_tx, pid_rx) = tokio::sync::mpsc::unbounded_channel();
         let cancellation_token = CancellationToken::new();
-        let context = JobContext::new(tx, pid_tx, cancellation_token);
+        let fg_job_pid = Arc::new(Mutex::new(None));
+        let context = BgContext::new(tx, pid_tx);
+        let sigstp = tokio::signal::unix::signal(SignalKind::from_raw(libc::SIGTSTP)).unwrap();
 
         Self {
             path,
@@ -86,37 +96,44 @@ impl Shell {
             last_status: None,
             autocomplete_options,
             fg_job: None,
+            fg_job_pid,
             bg_jobs: HashMap::new(),
             bg_job_remove_channel: rx,
             bg_job_set_pid: pid_rx,
-            job_context: context,
+            bg_context: context,
+            sigstp,
+            cancellation_token,
         }
     }
 
     pub async fn start(&mut self) -> tokio::io::Result<()> {
         let mut stderr = io::stderr();
 
+        let _ = disable_ctrl_z(&io::stdin());
         let mut readline = Readline::new_with_prompt(DirPrompt).await;
         readline.vim_mode_enabled = true;
         readline.autocomplete_options = self.autocomplete_options.clone();
         let mut input = String::new();
 
-        unsafe {
-            libc::signal(libc::SIGTSTP, libc::SIG_IGN);
-            override_sigtstp();
-        }
-
-        let mut sigstp = tokio::signal::unix::signal(SignalKind::from_raw(libc::SIGTSTP)).unwrap();
         loop {
+            if self.fg_job.is_some() {
+                readline.prompt = None;
+                disable_raw_mode()?;
+                enable_cbreak_mode()?;
+            } else {
+                readline.prompt = Some(DirPrompt);
+                enable_cbreak_mode()?;
+            }
             select! {
                 Some(job_id) = self.bg_job_remove_channel.recv() => {
                     self.handle_bg_job_completition(job_id).await?;
                 },
                 Some((job_id, pid)) = self.bg_job_set_pid.recv() => {
-                    self.update_job_pid(job_id, pid);
+                    self.update_bg_job_pid(job_id, pid);
                 },
-                _ = sigstp.recv() => {
-                    // ignore for now
+                _ = self.sigstp.recv() => {
+                    println!("ctlr-z");
+                    self.pause_fg_job().await;
                 }
                 fg_job_result = async {
                     if let Some(handle) = self.fg_job.as_mut() {
@@ -125,30 +142,20 @@ impl Shell {
                         None
                     }
                 }, if self.fg_job.is_some() => {
-                    if let Some(fg_job_result) = fg_job_result {
-                        self.last_status = Some(fg_job_result??);
+                    if let Some(Ok(Some(Ok(fg_job_result)))) = fg_job_result {
+                        self.last_status = Some(fg_job_result);
                     }
                     self.fg_job = None;
 
                 }
-                signal = readline.read(&mut input), if self.fg_job.is_none() => {
-                    match signal? {
-                        Signal::CtrlZ => {
-                            crossterm::terminal::disable_raw_mode().ok();
-                            unsafe {
-                                libc::kill(libc::getpid(), libc::SIGTSTP);
-                            }
-                            crossterm::terminal::enable_raw_mode().ok();
-                            continue;
-                        },
-                        Signal::CtrlD => {
-                            self.job_context.global_cancelation_token.cancel();
-                            // All concurrent futures in this select is cancellation safe, so we are
-                            // free to call a break here.
-                            break;
-                        }
-                        _ => {}
+                signal = readline.read(&mut input) => {
+                    if signal? == Signal::CtrlD {
+                        self.cancellation_token.cancel();
+                        // All concurrent futures in this select is cancellation safe, so we are
+                        // free to call a break here.
+                        break;
                     }
+
                     if !input.is_empty() {
                         match Command::parse(input.trim_start()).await {
                             Ok(command) => self.execute(command).await?,
@@ -163,6 +170,9 @@ impl Shell {
                 std::env::set_var("status", status.to_string());
             }
         }
+
+        disable_cbreak_mode()?;
+        disable_raw_mode()?;
 
         Ok(())
     }
@@ -218,20 +228,24 @@ impl Shell {
         match command.kind {
             CommandKind::Exit { status_code } => exit(status_code),
             CommandKind::ExternalCommand { .. } => {
-                let context = self.job_context.clone();
                 if command.is_bg_job {
-                    let job =
-                        execute_external_command(self.path.clone(), command, None, Some(context));
+                let context = self.bg_context.clone();
+                    let job = execute_external_command(self.path.clone(), command, None, context);
                     let handle = tokio::spawn(
-                        self.job_context
-                            .global_cancelation_token
+                        self.cancellation_token
                             .clone()
                             .run_until_cancelled_owned(job),
                     );
                     self.bg_jobs.insert(handle.id(), Job::new(handle));
                 } else {
-                    let job = execute_external_command(self.path.clone(), command, None, None);
-                    self.fg_job = Some(tokio::spawn(job));
+                    let context = FgContext::new(&self.fg_job_pid);
+                    let job = execute_external_command(self.path.clone(), command, None, context);
+                    let handle = tokio::spawn(
+                        self.cancellation_token
+                            .clone()
+                            .run_until_cancelled_owned(job),
+                    );
+                    self.fg_job = Some(handle);
                     // let exit_status =
                     //     execute_external_command(self.path.clone(), command, None, None).await?;
                     // self.last_status = Some(exit_status);
@@ -300,7 +314,7 @@ impl Shell {
         Ok(())
     }
 
-    fn update_job_pid(&mut self, job_id: tokio::task::Id, pid: Option<u32>) {
+    fn update_bg_job_pid(&mut self, job_id: tokio::task::Id, pid: Option<u32>) {
         if let Some(job) = self.bg_jobs.get_mut(&job_id) {
             job.pid = pid;
         }
@@ -314,6 +328,24 @@ impl Shell {
         }
         out.flush().await?;
         Ok(())
+    }
+
+    // Pauses currently running forground job and moves it to the background
+    async fn pause_fg_job(&mut self) {
+        let job = self.fg_job.take();
+        let pid = self.fg_job_pid.lock().unwrap().take();
+
+        let (Some(job), Some(pid)) = (job, pid) else {
+            return;
+        };
+
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTSTP);
+        }
+
+        let id = job.id();
+        let job = Job::new_with_pid(job, pid);
+        self.bg_jobs.insert(id, job);
     }
 }
 
@@ -454,12 +486,15 @@ async fn open_file_async<P: AsRef<Path>>(path: P, append: bool) -> io::Result<to
         .await
 }
 
-fn execute_external_command<'a>(
+fn execute_external_command<'a, Ctx>(
     path: String,
     command: Command,
     pipe_input: Option<Vec<u8>>,
-    bg_context: Option<JobContext>,
-) -> Pin<Box<dyn Future<Output = io::Result<ExitStatus>> + 'a + Send>> {
+    context: Ctx,
+) -> Pin<Box<dyn Future<Output = io::Result<ExitStatus>> + 'a + Send>>
+where
+    Ctx: Context + Clone + Send + 'a,
+{
     Box::pin(async move {
         let CommandKind::ExternalCommand { name, input } = command.kind else {
             return Ok(ExitStatus::default());
@@ -494,7 +529,7 @@ fn execute_external_command<'a>(
             Stdio::inherit()
         };
 
-        disable_raw_mode()?;
+        // disable_raw_mode()?;
 
         let mut child = SysCommand::new(canonical_name)
             .args(input)
@@ -503,9 +538,7 @@ fn execute_external_command<'a>(
             .stderr(stderr)
             .spawn()?;
 
-        if let Some(ref context) = bg_context {
-            let _ = context.set_pid(tokio::task::id(), child.id());
-        }
+        let _ = context.set_pid(tokio::task::id(), child.id());
 
         if let Some(pipe_input) = pipe_input {
             if let Some(ref mut stdin) = child.stdin {
@@ -520,7 +553,7 @@ fn execute_external_command<'a>(
                     path.clone(),
                     *sub.clone(),
                     Some(output.stdout),
-                    bg_context.clone(),
+                    context.clone(),
                 )
                 .await?;
                 output.status
@@ -531,11 +564,9 @@ fn execute_external_command<'a>(
             child.wait().await?
         };
 
-        enable_raw_mode()?;
+        // enable_raw_mode()?;
 
-        if let Some(context) = bg_context {
-            let _ = context.remove(tokio::task::id());
-        }
+        let _ = context.remove(tokio::task::id());
 
         Ok(status)
     })

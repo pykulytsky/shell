@@ -57,7 +57,6 @@ pub struct Shell {
 
     fg_job: Option<tokio::task::JoinHandle<Option<io::Result<ExitStatus>>>>,
     fg_job_pid: Arc<Mutex<Option<u32>>>,
-    // to be able to kill or stop process
     bg_jobs: JobList,
     bg_job_remove_channel: UnboundedReceiver<tokio::task::Id>,
     /// Receiving part of channel used to set process id of spawned process

@@ -8,8 +8,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-#[derive(Debug)]
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 pub(crate) enum JobStatus {
     Running,
     Paused,
@@ -44,9 +43,10 @@ pub(crate) type JobList = std::collections::HashMap<tokio::task::Id, Job>;
 
 pub trait Context {
     type Result;
+
     fn set_pid(&self, job_id: tokio::task::Id, pid: Option<u32>) -> Self::Result;
 
-    fn remove(&self, job_id: tokio::task::Id) -> Result<(), SendError<tokio::task::Id>>;
+    fn remove(&self, job_id: tokio::task::Id) -> Self::Result;
 }
 
 #[derive(Debug)]
@@ -73,8 +73,10 @@ impl Context for BgContext {
         self.set_pid_tx.send((job_id, pid))
     }
 
-    fn remove(&self, job_id: tokio::task::Id) -> Result<(), SendError<tokio::task::Id>> {
-        self.bg_job_remove_tx.send(job_id)
+    fn remove(&self, job_id: tokio::task::Id) -> Self::Result {
+        self.bg_job_remove_tx
+            .send(job_id)
+            .map_err(|err| SendError((err.0, None)))
     }
 }
 
@@ -105,10 +107,8 @@ impl Context for FgContext {
         *lock = pid;
     }
 
-    fn remove(&self, _job_id: tokio::task::Id) -> Result<(), SendError<tokio::task::Id>> {
+    fn remove(&self, _job_id: tokio::task::Id) -> Self::Result {
         self.pid.lock().unwrap().take();
-
-        Ok(())
     }
 }
 

@@ -9,20 +9,33 @@ use tokio::{
 };
 
 #[derive(Debug)]
+#[derive(PartialEq)]
+pub(crate) enum JobStatus {
+    Running,
+    Paused,
+}
+
+#[derive(Debug)]
 pub(crate) struct Job<R = Option<io::Result<ExitStatus>>> {
     pub(crate) handle: JoinHandle<R>,
     pub(crate) pid: Option<u32>,
+    pub(crate) status: JobStatus,
 }
 
 impl<R> Job<R> {
     pub fn new(handle: JoinHandle<R>) -> Self {
-        Self { handle, pid: None }
+        Self {
+            handle,
+            pid: None,
+            status: JobStatus::Running,
+        }
     }
 
     pub fn new_with_pid(handle: JoinHandle<R>, pid: u32) -> Self {
         Self {
             handle,
             pid: Some(pid),
+            status: JobStatus::Running,
         }
     }
 }

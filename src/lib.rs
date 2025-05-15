@@ -2,7 +2,7 @@
 
 use autocomplete::Trie;
 use command::{Command, CommandKind, SinkKind};
-use context::{BgContext, Context, FgContext, Job, JobList};
+use context::{BgContext, Context, FgContext, Job, JobList, JobStatus};
 use crossterm::terminal::disable_raw_mode;
 use glob::glob;
 use prompt::DirPrompt;
@@ -132,8 +132,10 @@ impl Shell {
                     self.update_bg_job_pid(job_id, pid);
                 },
                 _ = self.sigstp.recv() => {
-                    println!("ctlr-z");
-                    self.pause_fg_job().await;
+                    let job_id = self.pause_fg_job().await;
+                    if let Some(id) = job_id {
+                        println!("Job {id} has been stopped and moved to background");
+                    }
                 }
                 fg_job_result = async {
                     if let Some(handle) = self.fg_job.as_mut() {
@@ -272,10 +274,26 @@ impl Shell {
             }
             CommandKind::Fg(pid) => {
                 if let Some(job) = self.bg_jobs.values().find(|job| job.pid == pid) {
+                    // TODO: modify status of this job to Running after this
+                    if job.status == JobStatus::Paused {
+                        if let Some(pid) = job.pid {
+                            unsafe {
+                                libc::kill(pid as i32, libc::SIGCONT);
+                            }
+                        }
+                    }
                     self.handle_bg_job_completition(job.handle.id()).await?;
                 } else if let Some(job) = self.bg_jobs.iter().next() {
+                    // TODO: modify status of this job to Running after this
+                    if job.1.status == JobStatus::Paused {
+                        if let Some(pid) = job.1.pid {
+                            unsafe {
+                                libc::kill(pid as i32, libc::SIGCONT);
+                            }
+                        }
+                    }
                     // TODO: this is not
-                    // optiomal, as HashMap iterates "randomly" over it's items.
+                    // optimal, as HashMap iterates "randomly" over it's items.
                     self.handle_bg_job_completition(*job.0).await?;
                 } else {
                     let mut stderr = io::stderr();
@@ -331,12 +349,12 @@ impl Shell {
     }
 
     // Pauses currently running forground job and moves it to the background
-    async fn pause_fg_job(&mut self) {
+    async fn pause_fg_job(&mut self) -> Option<tokio::task::Id> {
         let job = self.fg_job.take();
         let pid = self.fg_job_pid.lock().unwrap().take();
 
         let (Some(job), Some(pid)) = (job, pid) else {
-            return;
+            return None;
         };
 
         unsafe {
@@ -344,8 +362,11 @@ impl Shell {
         }
 
         let id = job.id();
-        let job = Job::new_with_pid(job, pid);
+        let mut job = Job::new_with_pid(job, pid);
+        job.status = JobStatus::Paused;
         self.bg_jobs.insert(id, job);
+
+        Some(id)
     }
 }
 

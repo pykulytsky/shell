@@ -338,10 +338,18 @@ impl Shell {
     }
 
     async fn show_jobs<S: AsyncWrite + Unpin>(&self, out: &mut S) -> io::Result<()> {
-        out.write_all(b"Job\tGroup\n").await?;
+        out.write_all(b"Job\tGroup\tStatus\n").await?;
         for job in &self.bg_jobs {
-            out.write_all(format!("{}\t{}\n", job.0, job.1.pid.unwrap_or(0)).as_bytes())
-                .await?;
+            out.write_all(
+                format!(
+                    "{}\t{}\t{:?}\n",
+                    job.0,
+                    job.1.pid.unwrap_or(0),
+                    job.1.status,
+                )
+                .as_bytes(),
+            )
+            .await?;
         }
         out.flush().await?;
         Ok(())

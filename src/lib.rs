@@ -2,7 +2,7 @@
 
 use autocomplete::Trie;
 use command::{Command, CommandKind, SinkKind};
-use context::{BgContext, Context, FgContext, Job, JobList, JobStatus};
+use context::{BgContext, Context, FgContext, Job, JobRegistry, JobStatus};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use glob::glob;
 use prompt::DirPrompt;
@@ -57,7 +57,7 @@ pub struct Shell {
 
     fg_job: Option<tokio::task::JoinHandle<Option<io::Result<ExitStatus>>>>,
     fg_job_pid: Arc<Mutex<Option<u32>>>,
-    bg_jobs: JobList,
+    bg_jobs: JobRegistry,
     bg_job_remove_channel: UnboundedReceiver<tokio::task::Id>,
     /// Receiving part of channel used to set process id of spawned process
     bg_job_set_pid: UnboundedReceiver<(tokio::task::Id, Option<u32>)>,
@@ -82,11 +82,11 @@ impl Shell {
             }
         }
 
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (remove_tx, remove_rx) = tokio::sync::mpsc::unbounded_channel();
         let (pid_tx, pid_rx) = tokio::sync::mpsc::unbounded_channel();
         let cancellation_token = CancellationToken::new();
         let fg_job_pid = Arc::new(Mutex::new(None));
-        let context = BgContext::new(tx, pid_tx);
+        let context = BgContext::new(remove_tx, pid_tx);
         let sigstp = tokio::signal::unix::signal(SignalKind::from_raw(libc::SIGTSTP)).unwrap();
 
         Self {
@@ -97,7 +97,7 @@ impl Shell {
             fg_job: None,
             fg_job_pid,
             bg_jobs: HashMap::new(),
-            bg_job_remove_channel: rx,
+            bg_job_remove_channel: remove_rx,
             bg_job_set_pid: pid_rx,
             bg_context: context,
             sigstp,
@@ -113,9 +113,11 @@ impl Shell {
         readline.vim_mode_enabled = true;
         readline.autocomplete_options = self.autocomplete_options.clone();
         let mut input = String::new();
+        let mut ctrl_d_scheduled = false;
 
         loop {
             if self.fg_job.is_some() {
+                // TODO: maybe find a way to not do it (at least here)
                 readline.prompt = None;
                 disable_raw_mode()?;
                 enable_cbreak_mode()?;
@@ -147,14 +149,27 @@ impl Shell {
                         self.last_status = Some(fg_job_result);
                     }
                     self.fg_job = None;
-
+                    if ctrl_d_scheduled {
+                        self.cancellation_token.cancel();
+                        // All concurrent futures in this select is cancellation safe, so we are
+                        // free to call a break here. If there is currently running fg job,
+                        // we manyally wait untill it finishes and only then break out of this
+                        // loop.
+                        break;
+                    }
                 }
                 signal = readline.read(&mut input) => {
                     if signal? == Signal::CtrlD {
-                        self.cancellation_token.cancel();
-                        // All concurrent futures in this select is cancellation safe, so we are
-                        // free to call a break here.
-                        break;
+                        if self.fg_job.is_some() && !ctrl_d_scheduled {
+                            ctrl_d_scheduled = true;
+                        } else {
+                            self.cancellation_token.cancel();
+                            // All concurrent futures in this select is cancellation safe, so we are
+                            // free to call a break here. If there is currently running fg job,
+                            // we manyally wait untill it finishes and only then break out of this
+                            // loop.
+                            break;
+                        }
                     }
 
                     if !input.is_empty() {
@@ -272,35 +287,7 @@ impl Shell {
                 self.show_jobs(&mut out).await?;
             }
             CommandKind::Fg(pid) => {
-                if let Some(job) = self.bg_jobs.values().find(|job| job.pid == pid) {
-                    // TODO: modify status of this job to Running after this
-                    if job.status == JobStatus::Paused {
-                        if let Some(pid) = job.pid {
-                            unsafe {
-                                libc::kill(pid as i32, libc::SIGCONT);
-                            }
-                        }
-                    }
-                    self.handle_bg_job_completition(job.handle.id()).await?;
-                } else if let Some(job) = self.bg_jobs.iter().next() {
-                    // TODO: modify status of this job to Running after this
-                    if job.1.status == JobStatus::Paused {
-                        if let Some(pid) = job.1.pid {
-                            unsafe {
-                                libc::kill(pid as i32, libc::SIGCONT);
-                            }
-                        }
-                    }
-                    // TODO: this is not
-                    // optimal, as HashMap iterates "randomly" over it's items.
-                    self.handle_bg_job_completition(*job.0).await?;
-                } else {
-                    let mut stderr = io::stderr();
-                    stderr
-                        .write_all(b"No jobs where found with given PID\r\n")
-                        .await?;
-                    stderr.flush().await?;
-                }
+                self.move_job_to_foreground(pid).await?;
             }
         }
 
@@ -338,11 +325,11 @@ impl Shell {
     }
 
     async fn show_jobs<S: AsyncWrite + Unpin>(&self, out: &mut S) -> io::Result<()> {
-        out.write_all(b"Job\tGroup\tStatus\n").await?;
+        out.write_all(b"Job\tGroup\tStatus\r\n").await?;
         for job in &self.bg_jobs {
             out.write_all(
                 format!(
-                    "{}\t{}\t{:?}\n",
+                    "{}\t{}\t{:?}\r\n",
                     job.0,
                     job.1.pid.unwrap_or(0),
                     job.1.status,
@@ -374,6 +361,50 @@ impl Shell {
         self.bg_jobs.insert(id, job);
 
         Some(id)
+    }
+
+    async fn move_job_to_foreground(&mut self, id: Option<u32>) -> io::Result<()> {
+        let job = match id {
+            Some(id) => {
+                let job_id = self
+                    .bg_jobs
+                    .iter()
+                    .find(|job| job.1.pid == Some(id))
+                    .map(|(k, _)| *k);
+                match job_id {
+                    Some(job_id) => self.bg_jobs.remove(&job_id),
+                    None => None,
+                }
+            }
+            None => {
+                let random = self.bg_jobs.iter().next().map(|(key, _)| *key);
+                if let Some(key) = random {
+                    self.bg_jobs.remove(&key)
+                } else {
+                    None
+                }
+            }
+        };
+        if let Some(mut job) = job {
+            if self.fg_job.is_none() {
+                job.status = JobStatus::Running;
+                if let Some(pid) = job.pid {
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGCONT);
+                    }
+                }
+                *self.fg_job_pid.lock().unwrap() = job.pid;
+                self.fg_job = Some(job.handle);
+            }
+        } else {
+            let mut stderr = io::stderr();
+            stderr
+                .write_all(b"No jobs where found with given PID\r\n")
+                .await?;
+            stderr.flush().await?;
+        }
+
+        Ok(())
     }
 }
 

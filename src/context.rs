@@ -39,7 +39,7 @@ impl<R> Job<R> {
     }
 }
 
-pub(crate) type JobList = std::collections::HashMap<tokio::task::Id, Job>;
+pub(crate) type JobRegistry = std::collections::HashMap<tokio::task::Id, Job>;
 
 pub trait Context {
     type Result;

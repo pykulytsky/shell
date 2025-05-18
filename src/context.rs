@@ -8,6 +8,9 @@ use tokio::{
     task::JoinHandle,
 };
 
+pub type FgJob =
+    Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<Option<io::Result<ExitStatus>>>>>>;
+
 #[derive(Debug, PartialEq)]
 pub(crate) enum JobStatus {
     Running,

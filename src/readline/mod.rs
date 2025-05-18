@@ -71,7 +71,7 @@ pub struct Readline<P> {
     pub vim_mode_enabled: bool,
     vim_mode: VimMode,
 
-    stdin: Stdin,
+    pub stdin: Stdin,
     stdout: Stdout,
 }
 

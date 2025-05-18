@@ -2,7 +2,7 @@
 
 use autocomplete::Trie;
 use command::{Command, CommandKind, SinkKind};
-use context::{BgContext, Context, FgContext, Job, JobRegistry, JobStatus};
+use context::{BgContext, Context, FgContext, FgJob, Job, JobRegistry, JobStatus};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use glob::glob;
 use prompt::DirPrompt;
@@ -55,7 +55,7 @@ pub struct Shell {
     last_status: Option<ExitStatus>,
     pub autocomplete_options: Trie,
 
-    fg_job: Option<tokio::task::JoinHandle<Option<io::Result<ExitStatus>>>>,
+    fg_job: FgJob,
     fg_job_pid: Arc<Mutex<Option<u32>>>,
     bg_jobs: JobRegistry,
     bg_job_remove_channel: UnboundedReceiver<tokio::task::Id>,
@@ -94,7 +94,7 @@ impl Shell {
             path_executables,
             last_status: None,
             autocomplete_options,
-            fg_job: None,
+            fg_job: Arc::new(tokio::sync::Mutex::new(None)),
             fg_job_pid,
             bg_jobs: HashMap::new(),
             bg_job_remove_channel: remove_rx,
@@ -115,16 +115,8 @@ impl Shell {
         let mut input = String::new();
         let mut ctrl_d_scheduled = false;
 
+        enable_raw_mode()?;
         loop {
-            if self.fg_job.is_some() {
-                // TODO: maybe find a way to not do it (at least here)
-                readline.prompt = None;
-                disable_raw_mode()?;
-                enable_cbreak_mode()?;
-            } else {
-                readline.prompt = Some(DirPrompt);
-                enable_raw_mode()?;
-            }
             select! {
                 Some(job_id) = self.bg_job_remove_channel.recv() => {
                     self.handle_bg_job_completition(job_id).await?;
@@ -137,18 +129,24 @@ impl Shell {
                     if let Some(id) = job_id {
                         println!("Job {id} has been stopped and moved to background");
                     }
+                    disable_cbreak_mode()?;
+                    enable_raw_mode()?;
+                    readline.prompt = Some(DirPrompt);
                 }
                 fg_job_result = async {
-                    if let Some(handle) = self.fg_job.as_mut() {
+                    if let Some(handle) = self.fg_job.lock().await.as_mut() {
                         Some(handle.await)
                     } else {
                         None
                     }
-                }, if self.fg_job.is_some() => {
+                }, if self.fg_job.lock().await.is_some() => {
                     if let Some(Ok(Some(Ok(fg_job_result)))) = fg_job_result {
                         self.last_status = Some(fg_job_result);
                     }
-                    self.fg_job = None;
+                    *self.fg_job.lock().await = None;
+                    disable_cbreak_mode()?;
+                    enable_raw_mode()?;
+                    readline.prompt = Some(DirPrompt);
                     if ctrl_d_scheduled {
                         self.cancellation_token.cancel();
                         // All concurrent futures in this select is cancellation safe, so we are
@@ -160,7 +158,7 @@ impl Shell {
                 }
                 signal = readline.read(&mut input) => {
                     if signal? == Signal::CtrlD {
-                        if self.fg_job.is_some() && !ctrl_d_scheduled {
+                        if self.fg_job.lock().await.is_some() && !ctrl_d_scheduled {
                             ctrl_d_scheduled = true;
                         } else {
                             self.cancellation_token.cancel();
@@ -174,7 +172,13 @@ impl Shell {
 
                     if !input.is_empty() {
                         match Command::parse(input.trim_start()).await {
-                            Ok(command) => self.execute(command).await?,
+                            Ok(command) => {
+                                if (matches!(command.kind, CommandKind::ExternalCommand{..}) && !command.is_bg_job)
+                                    || matches!(command.kind, CommandKind::Fg{..}) {
+                                    readline.prompt = None;
+                                }
+                                self.execute(command).await?;
+                            },
                             Err(err) => stderr.write_all(format!("{err}\r\n").as_bytes()).await?,
                         }
                         input.clear();
@@ -256,12 +260,14 @@ impl Shell {
                 } else {
                     let context = FgContext::new(&self.fg_job_pid);
                     let job = execute_external_command(self.path.clone(), command, None, context);
+                    disable_raw_mode()?;
+                    enable_cbreak_mode()?;
                     let handle = tokio::spawn(
                         self.cancellation_token
                             .clone()
                             .run_until_cancelled_owned(job),
                     );
-                    self.fg_job = Some(handle);
+                    *self.fg_job.lock().await = Some(handle);
                     // let exit_status =
                     //     execute_external_command(self.path.clone(), command, None, None).await?;
                     // self.last_status = Some(exit_status);
@@ -344,7 +350,7 @@ impl Shell {
 
     // Pauses currently running forground job and moves it to the background
     async fn pause_fg_job(&mut self) -> Option<tokio::task::Id> {
-        let job = self.fg_job.take();
+        let job = self.fg_job.lock().await.take();
         let pid = self.fg_job_pid.lock().unwrap().take();
 
         let (Some(job), Some(pid)) = (job, pid) else {
@@ -386,7 +392,7 @@ impl Shell {
             }
         };
         if let Some(mut job) = job {
-            if self.fg_job.is_none() {
+            if self.fg_job.lock().await.is_none() {
                 job.status = JobStatus::Running;
                 if let Some(pid) = job.pid {
                     unsafe {
@@ -394,7 +400,9 @@ impl Shell {
                     }
                 }
                 *self.fg_job_pid.lock().unwrap() = job.pid;
-                self.fg_job = Some(job.handle);
+                disable_raw_mode()?;
+                enable_cbreak_mode()?;
+                *self.fg_job.lock().await = Some(job.handle);
             }
         } else {
             let mut stderr = io::stderr();

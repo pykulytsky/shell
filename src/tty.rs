@@ -50,3 +50,23 @@ pub(crate) fn disable_cbreak_mode() -> std::io::Result<()> {
     tcsetattr(fd, SetArg::TCSAFLUSH, &termios)?;
     Ok(())
 }
+
+pub fn drain_pty(fd: impl AsFd) {
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    use nix::unistd::read;
+
+    let mut buf = [0u8; 1024];
+
+    // Set non-blocking
+    let old_flags = fcntl(&fd, FcntlArg::F_GETFL).unwrap();
+    fcntl(
+        &fd,
+        FcntlArg::F_SETFL(OFlag::from_bits_truncate(old_flags) | OFlag::O_NONBLOCK),
+    )
+    .unwrap();
+
+    while read(&fd, &mut buf).unwrap_or(0) > 0 {}
+
+    // Restore original flags
+    fcntl(fd, FcntlArg::F_SETFL(OFlag::from_bits_truncate(old_flags))).unwrap();
+}

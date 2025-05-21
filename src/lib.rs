@@ -5,20 +5,24 @@ use autocomplete::Trie;
 use command::{Command, CommandKind, SinkKind};
 use context::{BgContext, Context, FgContext, FgJob, Job, JobRegistry, JobStatus};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use nix::pty::{openpty, OpenptyResult, Winsize};
 use prompt::DirPrompt;
 use readline::constants::{BUILTINS, DOUBLE_QUOTES_ESCAPE};
 use readline::signal::Signal;
 use readline::Readline;
 use std::collections::HashMap;
 use std::future::Future;
+use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::pin::Pin;
 use std::process::{exit, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{stderr, stdout, AsyncWrite};
 use tokio::select;
 use tokio::signal::unix::SignalKind;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::{
     fs::{read_dir, DirEntry},
     io::{self, AsyncWriteExt},
@@ -54,12 +58,18 @@ pub struct Shell {
     last_status: Option<ExitStatus>,
     pub autocomplete_options: Trie,
 
+    // master: tokio::fs::File,
+    // slave: OwnedFd,
+    is_interactive: Arc<AtomicBool>,
+
     fg_job: FgJob,
     fg_job_pid: Arc<Mutex<Option<u32>>>,
     bg_jobs: JobRegistry,
     bg_job_remove_channel: UnboundedReceiver<tokio::task::Id>,
     /// Receiving part of channel used to set process id of spawned process
     bg_job_set_pid: UnboundedReceiver<(tokio::task::Id, Option<u32>)>,
+    readline_rx: UnboundedReceiver<(String, Signal)>, // maybe should use watch channel
+    readline_tx: UnboundedSender<(String, Signal)>,
 
     cancellation_token: CancellationToken,
     bg_context: BgContext,
@@ -68,7 +78,7 @@ pub struct Shell {
 }
 
 impl Shell {
-    pub async fn new() -> Self {
+    pub async fn new() -> io::Result<Self> {
         let path = std::env::var("PATH").unwrap_or_else(|_| "".to_string());
         set_shell_envs();
         let path_executables = populate_path_executables(&path).await;
@@ -83,12 +93,13 @@ impl Shell {
 
         let (remove_tx, remove_rx) = tokio::sync::mpsc::unbounded_channel();
         let (pid_tx, pid_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
         let cancellation_token = CancellationToken::new();
         let fg_job_pid = Arc::new(Mutex::new(None));
         let context = BgContext::new(remove_tx, pid_tx);
-        let sigstp = tokio::signal::unix::signal(SignalKind::from_raw(libc::SIGTSTP)).unwrap();
+        let sigstp = tokio::signal::unix::signal(SignalKind::from_raw(libc::SIGTSTP))?;
 
-        Self {
+        Ok(Self {
             path,
             path_executables,
             last_status: None,
@@ -99,9 +110,90 @@ impl Shell {
             bg_job_remove_channel: remove_rx,
             bg_job_set_pid: pid_rx,
             bg_context: context,
+            readline_tx: command_tx,
+            readline_rx: command_rx,
             sigstp,
             cancellation_token,
+            // master,
+            // slave,
+            is_interactive: Arc::new(AtomicBool::new(true)),
+        })
+    }
+
+    pub async fn start2(&mut self) -> io::Result<()> {
+        let sigtstp_cancel = self.cancellation_token.clone();
+        let sigtstp_is_interactive = self.is_interactive.clone();
+        let _sigtstp_task = tokio::spawn(async move {
+            let mut sigtstp =
+                tokio::signal::unix::signal(SignalKind::from_raw(libc::SIGTSTP)).unwrap();
+            while let Some(Some(())) = sigtstp_cancel.run_until_cancelled(sigtstp.recv()).await {
+                println!("\nReceived Ctrl+Z (SIGTSTP), suspending child...");
+                // unsafe {
+                // libc::kill(pid as i32, libc::SIGTSTP);
+                // }
+                sigtstp_is_interactive.store(true, Ordering::Release);
+            }
+        });
+
+        enable_raw_mode()?;
+        let mut readline = Readline::new_with_prompt(DirPrompt).await;
+        readline.vim_mode_enabled = true;
+        readline.autocomplete_options = self.autocomplete_options.clone();
+        let readline_is_interactive = self.is_interactive.clone();
+        let readline_cancel = self.cancellation_token.clone();
+        let readline_tx = self.readline_tx.clone();
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let notified = notify.clone();
+        let _readline_task = tokio::spawn(async move {
+            let mut input = String::new();
+            loop {
+                if readline_is_interactive.load(Ordering::Acquire) {
+                    let read = readline_cancel.run_until_cancelled(readline.read(&mut input));
+                    if let Some(Ok(signal)) = read.await {
+                        let _ = readline_tx.send((std::mem::take(&mut input), signal));
+                    } else {
+                        break;
+                    }
+                }
+                notified.notified().await;
+            }
+        });
+
+        while let Some((input, signal)) = self.readline_rx.recv().await {
+            self.is_interactive.store(false, Ordering::SeqCst);
+            if signal == Signal::CtrlD {
+                break;
+            }
+            if !input.is_empty() {
+                let size = crossterm::terminal::window_size()?;
+                let pty = openpty(
+                    Some(&Winsize {
+                        ws_row: size.rows,
+                        ws_col: size.columns,
+                        ws_xpixel: 0,
+                        ws_ypixel: 0,
+                    }),
+                    None,
+                )?;
+
+                let master_fd = pty.master.as_raw_fd();
+                let std_master = unsafe { std::fs::File::from_raw_fd(master_fd) };
+                let OpenptyResult { master, slave } = pty;
+                std::mem::forget(master);
+                let master = tokio::fs::File::from_std(std_master);
+                let mut job = job::Job::new(input, &slave, &master, &self.is_interactive).await?;
+                let handle = job.spawn().await?;
+                job.wait().await?;
+                handle.stdin.await.unwrap();
+                handle.stdout.await.unwrap();
+            }
+            self.is_interactive.store(true, Ordering::SeqCst);
+            notify.notify_one();
         }
+
+        self.cancellation_token.cancel();
+        disable_raw_mode()?;
+        Ok(())
     }
 
     pub async fn start(&mut self) -> tokio::io::Result<()> {
@@ -499,13 +591,4 @@ where
 
         Ok(status)
     })
-}
-
-pub fn canonicalize_path<P: AsRef<str> + ?Sized>(shell_path: String, path: &P) -> Option<String> {
-    for p in shell_path.split(":") {
-        if path.as_ref().contains(p) {
-            return Some(path.as_ref().replace(p, "").replace("/", ""));
-        }
-    }
-    Some(path.as_ref().to_string())
 }

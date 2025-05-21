@@ -144,3 +144,12 @@ pub async fn open_file_async<P: AsRef<Path>>(path: P, append: bool) -> io::Resul
         .open(path)
         .await
 }
+
+pub fn canonicalize_path<P: AsRef<str> + ?Sized>(shell_path: String, path: &P) -> Option<String> {
+    for p in shell_path.split(":") {
+        if path.as_ref().contains(p) {
+            return Some(path.as_ref().replace(p, "").replace("/", ""));
+        }
+    }
+    Some(path.as_ref().to_string())
+}

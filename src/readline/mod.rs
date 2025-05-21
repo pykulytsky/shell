@@ -23,7 +23,7 @@ use crossterm::{
 };
 use std::collections::VecDeque;
 use tokio::{
-    io::{self, AsyncReadExt, AsyncWrite, AsyncWriteExt, Stdin, Stdout},
+    io::{self, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     time::timeout,
 };
 
@@ -70,9 +70,6 @@ pub struct Readline<P> {
 
     pub vim_mode_enabled: bool,
     vim_mode: VimMode,
-
-    pub stdin: Stdin,
-    stdout: Stdout,
 }
 
 impl Readline<DefaultPrompt> {
@@ -92,8 +89,6 @@ impl Readline<DefaultPrompt> {
             curr_autocomplete_options: vec![],
             autocomplete_cursor: 0,
             ctrl_arrow_buffer: [0u8; 2],
-            stdin: io::stdin(),
-            stdout: io::stdout(),
             vim_mode_enabled: true,
             vim_mode: VimMode::Insert,
         }
@@ -117,8 +112,6 @@ impl<P: Prompt> Readline<P> {
             curr_autocomplete_options: vec![],
             autocomplete_cursor: 0,
             ctrl_arrow_buffer: [0u8; 2],
-            stdin: io::stdin(),
-            stdout: io::stdout(),
             vim_mode_enabled: true,
             vim_mode: VimMode::Insert,
         }
@@ -126,6 +119,7 @@ impl<P: Prompt> Readline<P> {
 
     pub async fn read(&mut self, input: &mut String) -> io::Result<Signal> {
         let signal;
+        let mut stdout = io::stdout();
 
         // enable_raw_mode()?;
         loop {
@@ -133,7 +127,7 @@ impl<P: Prompt> Readline<P> {
                 if self.buffer.is_empty()
                     && !SHOULD_NOT_REDRAW_PROMPT.contains(&self.last_pressed.unwrap_or(0))
                 {
-                    prompt.draw(&mut self.stdout).await?;
+                    prompt.draw(&mut stdout).await?;
                 }
             }
 
@@ -161,7 +155,8 @@ impl<P: Prompt> Readline<P> {
         &mut self,
         input: &mut String,
     ) -> io::Result<Option<Signal>> {
-        if let Ok(byte) = self.stdin.read_u8().await {
+        let mut stdin = io::stdin();
+        if let Ok(byte) = stdin.read_u8().await {
             self.last_pressed = Some(byte);
             match byte {
                 RETURN | NEWLINE => {
@@ -203,7 +198,8 @@ impl<P: Prompt> Readline<P> {
         &mut self,
         input: &mut String,
     ) -> io::Result<Option<Signal>> {
-        let Some(command) = VimCommand::read(&mut self.stdin).await? else {
+        let mut stdin = io::stdin();
+        let Some(command) = VimCommand::read(&mut stdin).await? else {
             return Ok(None);
         };
 
@@ -322,9 +318,10 @@ impl<P: Prompt> Readline<P> {
     }
 
     async fn handle_newline(&mut self, input: &mut String) -> io::Result<()> {
+        let mut stdout = io::stdout();
         self.history_cursor = None;
-        self.stdout.write_all(b"\r\n").await?;
-        self.stdout.flush().await?;
+        stdout.write_all(b"\r\n").await?;
+        stdout.flush().await?;
 
         if !self.buffer.is_empty() {
             let p = &self.buffer.clone();
@@ -370,20 +367,22 @@ impl<P: Prompt> Readline<P> {
         self.buffer.clear();
         self.buffer.extend_from_slice(command.as_bytes());
         self.input_cursor = self.buffer.len();
-        self.stdout.write_all(b"\r\x1b[K").await?;
+        let mut stdout = io::stdout();
+        stdout.write_all(b"\r\x1b[K").await?;
         if let Some(prompt) = &self.prompt {
-            prompt.draw(&mut self.stdout).await?;
+            prompt.draw(&mut stdout).await?;
         }
-        self.stdout.write_all(command.as_bytes()).await?;
-        self.stdout.flush().await?;
+        stdout.write_all(command.as_bytes()).await?;
+        stdout.flush().await?;
 
         Ok(())
     }
 
     async fn handle_option_key(&mut self, byte: u8) -> io::Result<()> {
+        let mut stdin = io::stdin();
         let read_result = timeout(
             KEY_TIMEOUT_DURATION,
-            self.stdin.read_exact(&mut self.ctrl_arrow_buffer),
+            stdin.read_exact(&mut self.ctrl_arrow_buffer),
         )
         .await;
         if read_result.is_ok() {
@@ -407,6 +406,7 @@ impl<P: Prompt> Readline<P> {
         let command_str = std::str::from_utf8(&self.buffer)
             .map_err(|_| io::Error::other("Input is not valid utf-8"))?;
 
+        let mut stdout = io::stdout();
         if !self.curr_autocomplete_options.is_empty() {
             if self.autocomplete_cursor < 0 {
                 self.autocomplete_cursor = self.curr_autocomplete_options.len() as isize - 1;
@@ -419,13 +419,13 @@ impl<P: Prompt> Readline<P> {
                 return Ok(());
             };
 
-            self.stdout.write_all(b"\r\x1b[K").await?;
+            stdout.write_all(b"\r\x1b[K").await?;
             if let Some(prompt) = &self.prompt {
-                prompt.draw(&mut self.stdout).await?;
+                prompt.draw(&mut stdout).await?;
             }
-            self.stdout.write_all(suffix.as_bytes()).await?;
-            self.stdout.write_u8(b' ').await?;
-            self.stdout.flush().await?;
+            stdout.write_all(suffix.as_bytes()).await?;
+            stdout.write_u8(b' ').await?;
+            stdout.flush().await?;
 
             self.buffer.clear();
             self.buffer.extend(suffix.as_bytes());
@@ -442,9 +442,9 @@ impl<P: Prompt> Readline<P> {
         }
 
         let suffix = &suggestions[0].clone()[command_str.len()..];
-        self.stdout.write_all(suffix.as_bytes()).await?;
-        self.stdout.write_u8(b' ').await?;
-        self.stdout.flush().await?;
+        stdout.write_all(suffix.as_bytes()).await?;
+        stdout.write_u8(b' ').await?;
+        stdout.flush().await?;
 
         self.buffer.extend_from_slice(suffix.as_bytes());
         self.buffer.push(b' ');
@@ -474,8 +474,9 @@ impl<P: Prompt> Readline<P> {
             execute!(temp_buf, MoveLeft(self.input_cursor as u16))?;
             self.input_cursor = 0;
         }
-        self.stdout.write_all(&temp_buf).await?;
-        self.stdout.flush().await?;
+        let mut stdout = io::stdout();
+        stdout.write_all(&temp_buf).await?;
+        stdout.flush().await?;
         Ok(())
     }
 
@@ -498,8 +499,9 @@ impl<P: Prompt> Readline<P> {
             )?;
             self.input_cursor = self.buffer.len();
         }
-        self.stdout.write_all(&temp_buf).await?;
-        self.stdout.flush().await?;
+        let mut stdout = io::stdout();
+        stdout.write_all(&temp_buf).await?;
+        stdout.flush().await?;
         Ok(())
     }
 
@@ -513,8 +515,9 @@ impl<P: Prompt> Readline<P> {
 
     async fn handle_right_arrow(&mut self) -> io::Result<()> {
         if self.input_cursor < self.buffer.len() {
-            self.stdout.write_all(&[ESC, 91, 67]).await?;
-            self.stdout.flush().await?;
+            let mut stdout = io::stdout();
+            stdout.write_all(&[ESC, 91, 67]).await?;
+            stdout.flush().await?;
             self.input_cursor += 1;
         }
 
@@ -523,8 +526,9 @@ impl<P: Prompt> Readline<P> {
 
     async fn handle_left_arrow(&mut self) -> io::Result<()> {
         if self.input_cursor != 0 {
-            self.stdout.write_all(&[ESC, 91, 68]).await?;
-            self.stdout.flush().await?;
+            let mut stdout = io::stdout();
+            stdout.write_all(&[ESC, 91, 68]).await?;
+            stdout.flush().await?;
             self.input_cursor -= 1;
         }
 
@@ -535,8 +539,9 @@ impl<P: Prompt> Readline<P> {
         self.buffer.clear();
         self.input_cursor = 0;
         self.history_cursor = None;
-        self.stdout.write_all(b"\r\n").await?;
-        self.stdout.flush().await?;
+        let mut stdout = io::stdout();
+        stdout.write_all(b"\r\n").await?;
+        stdout.flush().await?;
 
         Ok(())
     }
@@ -557,8 +562,9 @@ impl<P: Prompt> Readline<P> {
 
         let mut temp_buf = Vec::with_capacity(128);
 
+        let mut stdout = io::stdout();
         if self.input_cursor == self.buffer.len() {
-            self.stdout.write_all(b"\x08 \x08").await?;
+            stdout.write_all(b"\x08 \x08").await?;
         } else {
             queue!(temp_buf, MoveLeft(1))?;
 
@@ -570,14 +576,15 @@ impl<P: Prompt> Readline<P> {
             let move_left = rest.len() + 1;
             queue!(temp_buf, MoveLeft(move_left as u16))?;
 
-            self.stdout.write_all(&temp_buf).await?;
+            stdout.write_all(&temp_buf).await?;
         }
-        self.stdout.flush().await?;
+        stdout.flush().await?;
 
         Ok(())
     }
 
     async fn handle_char(&mut self, byte: u8) -> io::Result<()> {
+        let mut stdout = io::stdout();
         if !self.buffer.is_empty() && self.input_cursor != self.buffer.len() {
             self.buffer.insert(self.input_cursor, byte);
             let mut temp_buf = vec![];
@@ -590,12 +597,12 @@ impl<P: Prompt> Readline<P> {
                 queue!(temp_buf, MoveLeft(move_left as u16))?;
             }
 
-            self.stdout.write_all(&temp_buf).await?;
+            stdout.write_all(&temp_buf).await?;
         } else {
             self.buffer.push(byte);
-            self.stdout.write_all(&[byte]).await?;
+            stdout.write_all(&[byte]).await?;
         }
-        self.stdout.flush().await?;
+        stdout.flush().await?;
         self.input_cursor += 1;
         self.history_cursor = None;
         self.autocomplete_cursor = 0;
@@ -607,13 +614,14 @@ impl<P: Prompt> Readline<P> {
     async fn handle_escape_sequence(&mut self) -> io::Result<()> {
         let mut buf = [0u8; 1];
 
-        let read_result = timeout(KEY_TIMEOUT_DURATION, self.stdin.read_exact(&mut buf)).await;
+        let mut stdin = io::stdin();
+        let read_result = timeout(KEY_TIMEOUT_DURATION, stdin.read_exact(&mut buf)).await;
 
         match read_result {
             Ok(Ok(_)) => match buf[0] {
                 DECSM => {
                     let mut arrow_code = [0u8; 1];
-                    if self.stdin.read_exact(&mut arrow_code).await.is_ok() {
+                    if stdin.read_exact(&mut arrow_code).await.is_ok() {
                         match arrow_code[0] {
                             UP_ARROW => self.handle_history_change(HistoryDirection::Up).await?,
                             DOWN_ARROW => {
@@ -686,8 +694,9 @@ impl<P: Prompt> Readline<P> {
         let move_left = rest.len() + deleted_len;
         queue!(temp_buf, MoveLeft(move_left as u16))?;
 
-        self.stdout.write_all(&temp_buf).await?;
-        self.stdout.flush().await?;
+        let mut stdout = io::stdout();
+        stdout.write_all(&temp_buf).await?;
+        stdout.flush().await?;
         disable_raw_mode()?;
         Ok(())
     }
@@ -727,8 +736,9 @@ impl<P: Prompt> Readline<P> {
         let move_left = rest.len() + deleted_len;
         queue!(temp_buf, MoveLeft(move_left as u16))?;
 
-        self.stdout.write_all(&temp_buf).await?;
-        self.stdout.flush().await?;
+        let mut stdout = io::stdout();
+        stdout.write_all(&temp_buf).await?;
+        stdout.flush().await?;
         disable_raw_mode()?;
         Ok(())
     }
@@ -743,18 +753,20 @@ impl<P: Prompt> Readline<P> {
             temp_buf,
             MoveRight((self.buffer.len() - self.input_cursor) as u16)
         )?;
-        self.stdout.write_all(&temp_buf).await?;
+        let mut stdout = io::stdout();
+        stdout.write_all(&temp_buf).await?;
         self.input_cursor = self.buffer.len();
-        self.stdout.flush().await?;
+        stdout.flush().await?;
         Ok(())
     }
 
     async fn move_cursor_to_line_start(&mut self) -> io::Result<()> {
         let mut temp_buf = vec![];
         execute!(temp_buf, MoveLeft(self.input_cursor as u16))?;
-        self.stdout.write_all(&temp_buf).await?;
+        let mut stdout = io::stdout();
+        stdout.write_all(&temp_buf).await?;
         self.input_cursor = 0;
-        self.stdout.flush().await?;
+        stdout.flush().await?;
         Ok(())
     }
 
@@ -811,8 +823,9 @@ impl<P: Prompt> Readline<P> {
 
         queue!(temp_buf, MoveLeft((rest.len() + deleted_len) as u16))?;
 
-        self.stdout.write_all(&temp_buf).await?;
-        self.stdout.flush().await?;
+        let mut stdout = io::stdout();
+        stdout.write_all(&temp_buf).await?;
+        stdout.flush().await?;
         Ok(())
     }
 }

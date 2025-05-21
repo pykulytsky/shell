@@ -7,8 +7,7 @@ use std::os::fd::OwnedFd;
 use std::process::{ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, AsyncReadExt};
 use tokio::task::JoinHandle;
 
 use tokio::fs::File;
@@ -116,6 +115,7 @@ impl Job {
         let mut master_writer = writer.try_into_std().unwrap();
         let stdin_task = tokio::task::spawn_blocking(move || {
             let mut stdin = std::io::stdin();
+            // Set stdin to non-blocking mode
             nix::fcntl::fcntl(
                 &stdin,
                 nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
@@ -141,6 +141,7 @@ impl Job {
                 }
             }
 
+            // Restore original state of stdin
             let flags = nix::fcntl::OFlag::from_bits_truncate(
                 nix::fcntl::fcntl(&stdin, nix::fcntl::FcntlArg::F_GETFL).unwrap(),
             );
@@ -186,7 +187,6 @@ impl Job {
     pub async fn wait(&mut self) -> io::Result<ExitStatus> {
         let exit_status = self.process.wait().await?;
         // Wait for stdout task to print output for commands that resolves quickly
-        tokio::time::sleep(Duration::from_millis(200)).await;
         drain_pty(&*self.master_reader);
         drain_pty(&*self.master_writer);
         self.cancel_token.cancel();

@@ -23,18 +23,23 @@ impl SinkKind {
 }
 
 #[derive(Debug, Clone)]
-pub enum CommandKind {
+pub enum Builtin {
     Exit { status_code: i32 },
     Cd { path: String },
-    ExternalCommand { name: OsString, args: Vec<String> },
     History,
     Jobs,
     Fg(Option<u32>),
 }
 
+#[derive(Debug, Clone)]
+pub enum CommandKind {
+    External { name: OsString, args: Vec<String> },
+    Builtin(Builtin),
+}
+
 impl Default for CommandKind {
     fn default() -> Self {
-        Self::Exit { status_code: 0 }
+        Self::Builtin(Builtin::Exit { status_code: 0 })
     }
 }
 
@@ -80,7 +85,7 @@ impl Command {
     }
 
     pub async fn read(mut args: Vec<String>) -> Result<Command, CommandError> {
-        use CommandKind::*;
+        use Builtin::*;
 
         let redirect_pos = args.iter().position(|a| REDIRECTS.contains(&a.as_str()));
         let redirect_to = redirect_pos.map(|pos| args[pos + 1].clone());
@@ -111,22 +116,22 @@ impl Command {
         }
 
         let kind = match args[0].as_str() {
-            "exit" => Exit {
+            "exit" => CommandKind::Builtin(Exit {
                 status_code: match args.get(1) {
                     Some(status_code) => status_code.parse::<i32>()?,
                     None => 0,
                 },
-            },
-            "cd" => Cd {
+            }),
+            "cd" => CommandKind::Builtin(Cd {
                 path: args[1].to_string(),
-            },
-            "history" => History,
-            "jobs" => Jobs,
-            "fg" => Fg(args.get(1).map(|pid| pid.parse().unwrap())),
+            }),
+            "history" => CommandKind::Builtin(History),
+            "jobs" => CommandKind::Builtin(Jobs),
+            "fg" => CommandKind::Builtin(Fg(args.get(1).map(|pid| pid.parse().unwrap()))),
             arg => {
                 let name = OsString::from(arg);
 
-                ExternalCommand {
+                CommandKind::External {
                     name,
                     args: args[1..].to_owned(),
                 }

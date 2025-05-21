@@ -4,7 +4,6 @@ use std::path::Path;
 use crate::readline::constants::GLOB;
 use crate::DOUBLE_QUOTES_ESCAPE;
 use glob::glob;
-use std::fs::{File, OpenOptions};
 use tokio::fs::{read_dir, DirEntry};
 use tokio::{io, task};
 
@@ -124,16 +123,6 @@ pub async fn populate_path_executables(path: &str) -> Vec<DirEntry> {
     path_executables
 }
 
-pub fn open_file<P: AsRef<Path>>(path: P, append: bool) -> std::io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .append(append)
-        .truncate(!append)
-        .open(path)
-}
-
 pub async fn open_file_async<P: AsRef<Path>>(path: P, append: bool) -> io::Result<tokio::fs::File> {
     tokio::fs::OpenOptions::new()
         .read(true)
@@ -143,13 +132,4 @@ pub async fn open_file_async<P: AsRef<Path>>(path: P, append: bool) -> io::Resul
         .truncate(!append)
         .open(path)
         .await
-}
-
-pub fn canonicalize_path<P: AsRef<str> + ?Sized>(shell_path: String, path: &P) -> Option<String> {
-    for p in shell_path.split(":") {
-        if path.as_ref().contains(p) {
-            return Some(path.as_ref().replace(p, "").replace("/", ""));
-        }
-    }
-    Some(path.as_ref().to_string())
 }

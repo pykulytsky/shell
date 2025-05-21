@@ -14,14 +14,14 @@ pub(crate) unsafe fn override_sigtstp() {
 
 pub extern "C" fn handle_sigtstp(_signum: i32) {}
 
-pub(crate) fn disable_ctrl_z(fd: &tokio::io::Stdin) -> io::Result<()> {
+pub fn disable_ctrl_z(fd: &tokio::io::Stdin) -> io::Result<()> {
     let mut termios = tcgetattr(fd).unwrap();
     termios.control_chars[SpecialCharacterIndices::VSUSP as usize] = 0;
     tcsetattr(fd, SetArg::TCSANOW, &termios).unwrap();
     Ok(())
 }
 
-pub(crate) fn enable_cbreak_mode() -> std::io::Result<()> {
+pub fn enable_cbreak_mode() -> std::io::Result<()> {
     let fd = tokio::io::stdin().as_fd().try_clone_to_owned()?;
     let mut termios = tcgetattr(&fd)?;
 
@@ -36,7 +36,7 @@ pub(crate) fn enable_cbreak_mode() -> std::io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn disable_cbreak_mode() -> std::io::Result<()> {
+pub fn disable_cbreak_mode() -> std::io::Result<()> {
     let fd = io::stdin().as_fd().try_clone_to_owned()?;
     let mut termios = tcgetattr(&fd)?;
 
@@ -57,7 +57,6 @@ pub fn drain_pty(fd: impl AsFd) {
 
     let mut buf = [0u8; 1024];
 
-    // Set non-blocking
     let old_flags = fcntl(&fd, FcntlArg::F_GETFL).unwrap();
     fcntl(
         &fd,
@@ -67,6 +66,5 @@ pub fn drain_pty(fd: impl AsFd) {
 
     while read(&fd, &mut buf).unwrap_or(0) > 0 {}
 
-    // Restore original flags
     fcntl(fd, FcntlArg::F_SETFL(OFlag::from_bits_truncate(old_flags))).unwrap();
 }

@@ -68,6 +68,7 @@ impl Job {
     /// Constructs new pty (Pseudo-terminal) and spawns a child in this pty.
     pub async fn new(
         name: impl AsRef<OsStr>,
+        args: Vec<String>,
         slave: &OwnedFd,
         master: &File,
         is_interactive: &Arc<AtomicBool>,
@@ -83,6 +84,7 @@ impl Job {
         let slave_stderr = std::fs::File::from(dup(slave)?);
 
         let child = Command::new(&name)
+            .args(args)
             .stdin(Stdio::from(slave_stdin))
             .stdout(Stdio::from(slave_stdout))
             .stderr(Stdio::from(slave_stderr))

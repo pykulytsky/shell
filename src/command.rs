@@ -26,7 +26,7 @@ impl SinkKind {
 pub enum CommandKind {
     Exit { status_code: i32 },
     Cd { path: String },
-    ExternalCommand { name: OsString, input: Vec<String> },
+    ExternalCommand { name: OsString, args: Vec<String> },
     History,
     Jobs,
     Fg(Option<u32>),
@@ -128,7 +128,7 @@ impl Command {
 
                 ExternalCommand {
                     name,
-                    input: args[1..].to_owned(),
+                    args: args[1..].to_owned(),
                 }
             }
         };

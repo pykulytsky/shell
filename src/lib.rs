@@ -5,12 +5,14 @@ use autocomplete::Trie;
 use command::{Command, CommandKind, SinkKind};
 use context::{BgContext, Context, FgContext, FgJob, Job, JobRegistry, JobStatus};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use job::JobHandle;
 use nix::pty::{openpty, OpenptyResult, Winsize};
 use prompt::DirPrompt;
 use readline::constants::{BUILTINS, DOUBLE_QUOTES_ESCAPE};
 use readline::signal::Signal;
 use readline::Readline;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::future::Future;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
@@ -23,6 +25,7 @@ use tokio::io::{stderr, stdout, AsyncWrite};
 use tokio::select;
 use tokio::signal::unix::SignalKind;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::Notify;
 use tokio::{
     fs::{read_dir, DirEntry},
     io::{self, AsyncWriteExt},
@@ -58,9 +61,8 @@ pub struct Shell {
     last_status: Option<ExitStatus>,
     pub autocomplete_options: Trie,
 
-    // master: tokio::fs::File,
-    // slave: OwnedFd,
     is_interactive: Arc<AtomicBool>,
+    notify_is_interactive: Arc<Notify>,
 
     fg_job: FgJob,
     fg_job_pid: Arc<Mutex<Option<u32>>>,
@@ -98,6 +100,7 @@ impl Shell {
         let fg_job_pid = Arc::new(Mutex::new(None));
         let context = BgContext::new(remove_tx, pid_tx);
         let sigstp = tokio::signal::unix::signal(SignalKind::from_raw(libc::SIGTSTP))?;
+        let notify_is_interactive = Arc::new(tokio::sync::Notify::new());
 
         Ok(Self {
             path,
@@ -114,9 +117,8 @@ impl Shell {
             readline_rx: command_rx,
             sigstp,
             cancellation_token,
-            // master,
-            // slave,
             is_interactive: Arc::new(AtomicBool::new(true)),
+            notify_is_interactive,
         })
     }
 
@@ -142,8 +144,7 @@ impl Shell {
         let readline_is_interactive = self.is_interactive.clone();
         let readline_cancel = self.cancellation_token.clone();
         let readline_tx = self.readline_tx.clone();
-        let notify = Arc::new(tokio::sync::Notify::new());
-        let notified = notify.clone();
+        let notified = self.notify_is_interactive.clone();
         let _readline_task = tokio::spawn(async move {
             let mut input = String::new();
             loop {
@@ -160,35 +161,28 @@ impl Shell {
         });
 
         while let Some((input, signal)) = self.readline_rx.recv().await {
-            self.is_interactive.store(false, Ordering::SeqCst);
             if signal == Signal::CtrlD {
                 break;
             }
             if !input.is_empty() {
-                let size = crossterm::terminal::window_size()?;
-                let pty = openpty(
-                    Some(&Winsize {
-                        ws_row: size.rows,
-                        ws_col: size.columns,
-                        ws_xpixel: 0,
-                        ws_ypixel: 0,
-                    }),
-                    None,
-                )?;
+                self.is_interactive.store(false, Ordering::SeqCst);
+                match Command::parse(input.trim_start()).await {
+                    Ok(command) => match command.kind {
+                        CommandKind::ExternalCommand { name, args } => {
+                            self.spawn_fg_job(name, args).await?;
+                        }
+                        _ => {
+                            self.execute_builtin(command).await?;
+                        }
+                    },
+                    Err(_) => {
+                        todo!("write error");
+                    }
+                };
 
-                let master_fd = pty.master.as_raw_fd();
-                let std_master = unsafe { std::fs::File::from_raw_fd(master_fd) };
-                let OpenptyResult { master, slave } = pty;
-                std::mem::forget(master);
-                let master = tokio::fs::File::from_std(std_master);
-                let mut job = job::Job::new(input, &slave, &master, &self.is_interactive).await?;
-                let handle = job.spawn().await?;
-                job.wait().await?;
-                handle.stdin.await.unwrap();
-                handle.stdout.await.unwrap();
+                self.is_interactive.store(true, Ordering::SeqCst);
             }
-            self.is_interactive.store(true, Ordering::SeqCst);
-            notify.notify_one();
+            self.notify_is_interactive.notify_one();
         }
 
         self.cancellation_token.cancel();
@@ -268,7 +262,7 @@ impl Shell {
                                     || matches!(command.kind, CommandKind::Fg{..}) {
                                     readline.prompt = None;
                                 }
-                                self.execute(command).await?;
+                                self.execute_builtin(command).await?;
                             },
                             Err(err) => stderr.write_all(format!("{err}\r\n").as_bytes()).await?,
                         }
@@ -319,7 +313,7 @@ impl Shell {
         None
     }
 
-    pub async fn execute(&mut self, command: Command) -> io::Result<()> {
+    pub async fn execute_builtin(&mut self, command: Command) -> io::Result<()> {
         let mut out: &mut (dyn AsyncWrite + Unpin) = match command.stdout_redirect {
             Some(ref out) => {
                 &mut open_file_async(out, command.sink.map(|s| s.is_append()).unwrap_or(false))
@@ -505,6 +499,38 @@ impl Shell {
 
         Ok(())
     }
+
+    async fn spawn_fg_job(&mut self, name: OsString, args: Vec<String>) -> io::Result<()> {
+        let size = crossterm::terminal::window_size()?;
+        let pty = openpty(
+            Some(&Winsize {
+                ws_row: size.rows,
+                ws_col: size.columns,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            }),
+            None,
+        )?;
+
+        let master_fd = pty.master.as_raw_fd();
+        let std_master = unsafe { std::fs::File::from_raw_fd(master_fd) };
+        let OpenptyResult { master, slave } = pty;
+        std::mem::forget(master);
+        let master = tokio::fs::File::from_std(std_master);
+        let mut job = job::Job::new(name, args, &slave, &master, &self.is_interactive).await?;
+        let handle = job.spawn().await?;
+        self.wait_job(job, handle).await?;
+
+        Ok(())
+    }
+
+    async fn wait_job(&mut self, mut job: job::Job, handle: JobHandle) -> io::Result<()> {
+        job.wait().await?;
+        handle.stdin.await?;
+        handle.stdout.await?;
+
+        Ok(())
+    }
 }
 
 fn execute_external_command<'a, Ctx>(
@@ -517,7 +543,7 @@ where
     Ctx: Context + Clone + Send + 'a,
 {
     Box::pin(async move {
-        let CommandKind::ExternalCommand { name, input } = command.kind else {
+        let CommandKind::ExternalCommand { name, args: input } = command.kind else {
             return Ok(ExitStatus::default());
         };
         let canonical_name = canonicalize_path(

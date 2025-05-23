@@ -22,6 +22,7 @@ use tokio::select;
 use tokio::signal::unix::SignalKind;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 use tokio::{
     fs::{read_dir, DirEntry},
     io::{self, AsyncWriteExt},
@@ -90,96 +91,13 @@ impl Shell {
     }
 
     pub async fn start(&mut self) -> io::Result<()> {
-        let sigtstp_cancel = self.cancellation_token.clone();
-        let sigtstp_is_interactive = self.is_interactive.clone();
-        let fg_job_pid = self.fg_job_pid.clone();
-        let sigtstp_received = self.sigtstp_received.clone();
-        let _sigtstp_task = tokio::spawn(async move {
-            let mut sigtstp =
-                tokio::signal::unix::signal(SignalKind::from_raw(libc::SIGTSTP)).unwrap();
-            while let Some(Some(())) = sigtstp_cancel.run_until_cancelled(sigtstp.recv()).await {
-                if !sigtstp_is_interactive.load(Ordering::SeqCst) {
-                    let fg_job_pid = fg_job_pid.lock().unwrap();
-                    if fg_job_pid.is_some() {
-                        println!("\nReceived Ctrl+Z (SIGTSTP), suspending child...\r");
-                        unsafe {
-                            libc::kill(fg_job_pid.unwrap() as i32, libc::SIGTSTP);
-                        }
-
-                        sigtstp_received.notify_one();
-                    }
-                }
-            }
-        });
+        let _sigtstp_task = self.spawn_sigtstp_task();
 
         enable_raw_mode()?;
-        let mut readline = Readline::new_with_prompt(DirPrompt).await;
-        readline.vim_mode_enabled = true;
-        readline.autocomplete_options = self.autocomplete_options.clone();
-        let readline_is_interactive = self.is_interactive.clone();
-        let readline_cancel = self.cancellation_token.clone();
-        let readline_tx = self.readline_tx.clone();
-        let notified = self.notify_is_interactive.clone();
-        let _readline_task = tokio::spawn(async move {
-            let mut input = String::new();
-            loop {
-                if readline_is_interactive.load(Ordering::Acquire) {
-                    let read = readline_cancel.run_until_cancelled(readline.read(&mut input));
-                    if let Some(Ok(signal)) = read.await {
-                        let _ = readline_tx.send((std::mem::take(&mut input), signal));
-                    } else {
-                        break;
-                    }
-                }
-                notified.notified().await;
-            }
-        });
+        let _readline_task = self.spawn_readline_task().await;
 
-        let sigtstp_received = self.sigtstp_received.clone();
         while let Some((input, signal)) = self.readline_rx.recv().await {
-            if signal == Signal::CtrlD {
-                break;
-            }
-            if !input.is_empty() {
-                self.is_interactive.store(false, Ordering::SeqCst);
-                match Command::parse(input.trim_start()).await {
-                    Ok(command) => match command.kind {
-                        CommandKind::External { name, args } => {
-                            let (mut job, handle) = self.spawn_fg_job(name, args).await?;
-                            select! {
-                                _ = self.wait_job(&mut job, handle) => {
-
-                                },
-                                _ = sigtstp_received.notified() => {
-                                    println!("received sigtstp in main loop\r");
-
-                                    job.paused.store(true, Ordering::SeqCst);
-
-                                    let flags = nix::fcntl::OFlag::from_bits_truncate(
-                                        nix::fcntl::fcntl(std::io::stdin(), nix::fcntl::FcntlArg::F_GETFL)
-                                            .unwrap(),
-                                    );
-                                    let new_flags = flags & !nix::fcntl::OFlag::O_NONBLOCK;
-                                    nix::fcntl::fcntl(
-                                        std::io::stdin(),
-                                        nix::fcntl::FcntlArg::F_SETFL(new_flags),
-                                    )
-                                    .unwrap();
-                                }
-                            }
-                        }
-                        _ => {
-                            self.execute_builtin(command).await?;
-                        }
-                    },
-                    Err(_) => {
-                        todo!("write error");
-                    }
-                };
-
-                self.is_interactive.store(true, Ordering::SeqCst);
-            }
-            self.notify_is_interactive.notify_one();
+            self.handle_prompt(input, signal).await?;
         }
 
         self.cancellation_token.cancel();
@@ -267,6 +185,39 @@ impl Shell {
         Ok(())
     }
 
+    async fn execute_external_command(
+        &mut self,
+        name: OsString,
+        args: Vec<String>,
+    ) -> io::Result<()> {
+        let (mut job, handle) = self.spawn_fg_job(name, args).await?;
+        select! {
+            Ok(exit_status) = job.wait() => {
+                handle.stdin.await?;
+                handle.stdout.await?;
+                self.last_status = Some(exit_status);
+            },
+            _ = self.sigtstp_received.notified() => {
+                println!("\nReceived Ctrl+Z (SIGTSTP), suspending child...\r");
+
+                job.stopped.store(true, Ordering::SeqCst);
+
+                let flags = nix::fcntl::OFlag::from_bits_truncate(
+                    nix::fcntl::fcntl(std::io::stdin(), nix::fcntl::FcntlArg::F_GETFL)
+                        .unwrap(),
+                );
+                let new_flags = flags & !nix::fcntl::OFlag::O_NONBLOCK;
+                nix::fcntl::fcntl(
+                    std::io::stdin(),
+                    nix::fcntl::FcntlArg::F_SETFL(new_flags),
+                )
+                .unwrap();
+            }
+        }
+
+        Ok(())
+    }
+
     async fn dump_history<S: AsyncWrite + Unpin>(&mut self, _sink: &mut S) -> io::Result<()> {
         // [TODO] update this function with regards to the fact that history is now handled by
         // [`Readline`]
@@ -337,12 +288,81 @@ impl Shell {
         Ok((job, handle))
     }
 
-    async fn wait_job(&mut self, job: &mut job::Job, handle: JobHandle) -> io::Result<()> {
-        let exit_status = job.wait().await?;
-        self.last_status = Some(exit_status);
-        handle.stdin.await?;
-        handle.stdout.await?;
+    fn spawn_sigtstp_task(&mut self) -> JoinHandle<()> {
+        let sigtstp_cancel = self.cancellation_token.clone();
+        let sigtstp_is_interactive = self.is_interactive.clone();
+        let fg_job_pid = self.fg_job_pid.clone();
+        let sigtstp_received = self.sigtstp_received.clone();
+        tokio::spawn(async move {
+            let mut sigtstp =
+                tokio::signal::unix::signal(SignalKind::from_raw(libc::SIGTSTP)).unwrap();
+            while let Some(Some(())) = sigtstp_cancel.run_until_cancelled(sigtstp.recv()).await {
+                if !sigtstp_is_interactive.load(Ordering::SeqCst) {
+                    let fg_job_pid = fg_job_pid.lock().unwrap();
+                    if fg_job_pid.is_some() {
+                        unsafe {
+                            libc::kill(fg_job_pid.unwrap() as i32, libc::SIGTSTP);
+                        }
+
+                        sigtstp_received.notify_one();
+                    }
+                }
+            }
+        })
+    }
+
+    async fn spawn_readline_task(&mut self) -> JoinHandle<()> {
+        let mut readline = Readline::new_with_prompt(DirPrompt).await;
+        readline.vim_mode_enabled = true;
+        readline.autocomplete_options = self.autocomplete_options.clone();
+        let readline_is_interactive = self.is_interactive.clone();
+        let readline_cancel = self.cancellation_token.clone();
+        let readline_tx = self.readline_tx.clone();
+        let notified = self.notify_is_interactive.clone();
+        tokio::spawn(async move {
+            let mut input = String::new();
+            loop {
+                if readline_is_interactive.load(Ordering::Acquire) {
+                    let read = readline_cancel.run_until_cancelled(readline.read(&mut input));
+                    if let Some(Ok(signal)) = read.await {
+                        let _ = readline_tx.send((std::mem::take(&mut input), signal));
+                    } else {
+                        break;
+                    }
+                }
+                notified.notified().await;
+            }
+        })
+    }
+
+    async fn handle_prompt(&mut self, input: String, signal: Signal) -> io::Result<()> {
+        if signal == Signal::CtrlD {
+            self.handle_exit();
+        }
+        if !input.is_empty() {
+            self.is_interactive.store(false, Ordering::SeqCst);
+            match Command::parse(input.trim_start()).await {
+                Ok(command) => match command.kind {
+                    CommandKind::External { name, args } => {
+                        self.execute_external_command(name, args).await?;
+                    }
+                    _ => {
+                        self.execute_builtin(command).await?;
+                    }
+                },
+                Err(_) => {
+                    todo!("write error");
+                }
+            };
+
+            self.is_interactive.store(true, Ordering::SeqCst);
+        }
+        self.notify_is_interactive.notify_one();
 
         Ok(())
+    }
+
+    fn handle_exit(&mut self) {
+        exit(0);
     }
 }

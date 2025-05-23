@@ -49,6 +49,13 @@ impl<R> JobHandle<R> {
     pub fn new(stdin: JoinHandle<R>, stdout: JoinHandle<R>) -> Self {
         Self { stdout, stdin }
     }
+
+    pub async fn wait(self) -> io::Result<()> {
+        self.stdin.await?;
+        self.stdout.await?;
+
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -62,7 +69,7 @@ pub struct Job {
     master_reader: Master,
     /// Wheater shell itself is interactive
     is_interactive: Arc<AtomicBool>,
-    pub(crate) paused: Arc<AtomicBool>,
+    pub(crate) stopped: Arc<AtomicBool>,
 }
 
 impl Job {
@@ -104,7 +111,7 @@ impl Job {
             master_writer,
             master_reader,
             is_interactive: Arc::clone(is_interactive),
-            paused: Arc::new(AtomicBool::new(false)),
+            stopped: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -113,7 +120,7 @@ impl Job {
     // TODO: stderr
     pub async fn spawn(&mut self) -> io::Result<JobHandle<()>> {
         let stdin_is_interactive = self.is_interactive.clone();
-        let stdin_paused = self.paused.clone();
+        let stdin_stopped = self.stopped.clone();
         let stdin_cancel_token = self.cancel_token.clone();
         let master_writer = self.master_writer.try_clone().await?;
         let Master(writer) = master_writer;
@@ -130,7 +137,7 @@ impl Job {
 
             while !stdin_cancel_token.is_cancelled() {
                 if !stdin_is_interactive.load(Ordering::SeqCst)
-                    && !stdin_paused.load(Ordering::SeqCst)
+                    && !stdin_stopped.load(Ordering::SeqCst)
                 {
                     match stdin.read(&mut buf) {
                         Ok(0) => break,
@@ -157,7 +164,7 @@ impl Job {
         });
 
         let stdout_is_interactive = self.is_interactive.clone();
-        let stdout_paused = self.paused.clone();
+        let stdout_stopped = self.stopped.clone();
         let stdout_cancel_token = self.cancel_token.clone();
         let mut master_reader = self.master_reader.try_clone().await?;
 
@@ -167,7 +174,7 @@ impl Job {
 
             loop {
                 if !stdout_is_interactive.load(Ordering::SeqCst)
-                    && !stdout_paused.load(Ordering::SeqCst)
+                    && !stdout_stopped.load(Ordering::SeqCst)
                 {
                     tokio::select! {
                         _ = stdout_cancel_token.cancelled() => break,

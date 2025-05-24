@@ -5,8 +5,10 @@ use std::io::Write;
 use std::ops::{Deref, DerefMut};
 use std::os::fd::OwnedFd;
 use std::process::{ExitStatus, Stdio};
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::LazyLock;
 use tokio::io::{self, AsyncReadExt};
 use tokio::task::JoinHandle;
 
@@ -15,6 +17,16 @@ use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
 
 use crate::tty::drain_pty;
+use crate::utils::set_stdin_blocking;
+
+#[derive(Debug, PartialEq)]
+pub enum JobState {
+    Started,
+    Running,
+    Stopped,
+}
+
+static ID: LazyLock<AtomicUsize> = LazyLock::new(|| AtomicUsize::new(1));
 
 #[derive(Debug)]
 pub struct Master(File);
@@ -60,6 +72,7 @@ impl<R> JobHandle<R> {
 
 #[derive(Debug)]
 pub struct Job {
+    pub id: usize,
     pub name: String,
     process: Child,
     pub pid: Option<u32>,
@@ -70,6 +83,7 @@ pub struct Job {
     /// Wheater shell itself is interactive
     is_interactive: Arc<AtomicBool>,
     pub(crate) stopped: Arc<AtomicBool>,
+    pub(crate) state: JobState,
 }
 
 impl Job {
@@ -103,7 +117,10 @@ impl Job {
         let master_writer = Master(master.try_clone().await?);
         let master_reader = Master(master.try_clone().await?);
 
+        let id = ID.fetch_add(1, Ordering::Relaxed);
+
         Ok(Self {
+            id,
             name,
             process: child,
             pid,
@@ -112,6 +129,7 @@ impl Job {
             master_reader,
             is_interactive: Arc::clone(is_interactive),
             stopped: Arc::new(AtomicBool::new(false)),
+            state: JobState::Started,
         })
     }
 
@@ -152,15 +170,11 @@ impl Job {
                         }
                         Err(_) => break,
                     }
+                } else {
+                    std::thread::yield_now();
                 }
             }
-
-            // Restore original state of stdin
-            let flags = nix::fcntl::OFlag::from_bits_truncate(
-                nix::fcntl::fcntl(&stdin, nix::fcntl::FcntlArg::F_GETFL).unwrap(),
-            );
-            let new_flags = flags & !nix::fcntl::OFlag::O_NONBLOCK;
-            nix::fcntl::fcntl(&stdin, nix::fcntl::FcntlArg::F_SETFL(new_flags)).unwrap();
+            set_stdin_blocking().unwrap();
         });
 
         let stdout_is_interactive = self.is_interactive.clone();
@@ -197,17 +211,40 @@ impl Job {
             }
         });
 
+        self.state = JobState::Running;
+
         Ok(JobHandle::new(stdin_task, stdout_task))
     }
 
     /// Waits for the inner process to complete, terminating all associated spawned tasks.
     pub async fn wait(&mut self) -> io::Result<ExitStatus> {
         let exit_status = self.process.wait().await?;
-        // Wait for stdout task to print output for commands that resolves quickly
         drain_pty(&*self.master_reader);
         drain_pty(&*self.master_writer);
         self.cancel_token.cancel();
 
         Ok(exit_status)
+    }
+
+    pub fn stop(&mut self) {
+        self.state = JobState::Stopped;
+        self.stopped.store(true, Ordering::SeqCst);
+    }
+
+    pub fn resume(&mut self) {
+        self.state = JobState::Running;
+        self.stopped.store(false, Ordering::SeqCst);
+    }
+}
+
+#[derive(Debug)]
+pub struct BgJob {
+    pub(crate) job: Job,
+    pub(crate) handle: JobHandle,
+}
+
+impl BgJob {
+    pub fn new(job: Job, handle: JobHandle) -> Self {
+        Self { job, handle }
     }
 }

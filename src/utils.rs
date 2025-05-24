@@ -133,3 +133,24 @@ pub async fn open_file_async<P: AsRef<Path>>(path: P, append: bool) -> io::Resul
         .open(path)
         .await
 }
+
+pub fn set_stdin_blocking() -> io::Result<()> {
+    let flags = nix::fcntl::OFlag::from_bits_truncate(nix::fcntl::fcntl(
+        std::io::stdin(),
+        nix::fcntl::FcntlArg::F_GETFL,
+    )?);
+    let new_flags = flags & !nix::fcntl::OFlag::O_NONBLOCK;
+    nix::fcntl::fcntl(std::io::stdin(), nix::fcntl::FcntlArg::F_SETFL(new_flags))?;
+
+    Ok(())
+}
+
+pub fn set_stdin_non_blocking() -> io::Result<()> {
+    let stdin = std::io::stdin();
+    nix::fcntl::fcntl(
+        &stdin,
+        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
+    )?;
+
+    Ok(())
+}

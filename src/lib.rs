@@ -4,7 +4,7 @@ use crate::utils::*;
 use autocomplete::Trie;
 use command::{Builtin, Command, CommandKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use job::{Job, JobHandle};
+use job::{BgJob, Job, JobHandle, JobState};
 use nix::pty::{openpty, OpenptyResult, Winsize};
 use prompt::DirPrompt;
 use readline::constants::{BUILTINS, DOUBLE_QUOTES_ESCAPE};
@@ -46,6 +46,8 @@ pub struct Shell {
     pub autocomplete_options: Trie,
 
     fg_job_pid: Arc<Mutex<Option<u32>>>,
+    bg_jobs: std::collections::BTreeMap<usize, BgJob>,
+
     is_interactive: Arc<AtomicBool>,
     notify_is_interactive: Arc<Notify>,
     sigtstp_received: Arc<Notify>,
@@ -74,6 +76,7 @@ impl Shell {
         let cancellation_token = CancellationToken::new();
         let notify_is_interactive = Arc::new(tokio::sync::Notify::new());
         let sigtstp_received = Arc::new(tokio::sync::Notify::new());
+        let bg_jobs = std::collections::BTreeMap::new();
 
         Ok(Self {
             path,
@@ -87,6 +90,7 @@ impl Shell {
             notify_is_interactive,
             sigtstp_received,
             fg_job_pid: Arc::new(Mutex::new(None)),
+            bg_jobs,
         })
     }
 
@@ -100,8 +104,7 @@ impl Shell {
             self.handle_prompt(input, signal).await?;
         }
 
-        self.cancellation_token.cancel();
-        disable_raw_mode()?;
+        self.handle_exit();
         Ok(())
     }
 
@@ -190,7 +193,13 @@ impl Shell {
         name: OsString,
         args: Vec<String>,
     ) -> io::Result<()> {
-        let (mut job, handle) = self.spawn_fg_job(name, args).await?;
+        let (job, handle) = self.spawn_fg_job(name, args).await?;
+        self.block_or_stop(job, handle).await?;
+
+        Ok(())
+    }
+
+    async fn block_or_stop(&mut self, mut job: Job, handle: JobHandle) -> io::Result<()> {
         select! {
             Ok(exit_status) = job.wait() => {
                 handle.stdin.await?;
@@ -200,18 +209,12 @@ impl Shell {
             _ = self.sigtstp_received.notified() => {
                 println!("\nReceived Ctrl+Z (SIGTSTP), suspending child...\r");
 
-                job.stopped.store(true, Ordering::SeqCst);
+                job.stop();
+                let id = job.id;
+                let bg_job = BgJob::new(job, handle);
+                self.bg_jobs.insert(id, bg_job);
 
-                let flags = nix::fcntl::OFlag::from_bits_truncate(
-                    nix::fcntl::fcntl(std::io::stdin(), nix::fcntl::FcntlArg::F_GETFL)
-                        .unwrap(),
-                );
-                let new_flags = flags & !nix::fcntl::OFlag::O_NONBLOCK;
-                nix::fcntl::fcntl(
-                    std::io::stdin(),
-                    nix::fcntl::FcntlArg::F_SETFL(new_flags),
-                )
-                .unwrap();
+                set_stdin_blocking()?;
             }
         }
 
@@ -233,24 +236,45 @@ impl Shell {
     }
 
     async fn show_jobs<S: AsyncWrite + Unpin>(&self, out: &mut S) -> io::Result<()> {
-        out.write_all(b"Job\tGroup\tStatus\r\n").await?;
-        // for job in &self.bg_jobs {
-        //     out.write_all(
-        //         format!(
-        //             "{}\t{}\t{:?}\r\n",
-        //             job.0,
-        //             job.1.pid.unwrap_or(0),
-        //             job.1.status,
-        //         )
-        //         .as_bytes(),
-        //     )
-        //     .await?;
-        // }
+        out.write_all(b"Job\tGroup\tState\tCommand\r\n").await?;
+        for (id, job) in &self.bg_jobs {
+            out.write_all(
+                format!(
+                    "{}\t{}\t{:?}\t{}\r\n",
+                    id,
+                    job.job.pid.unwrap_or(0),
+                    job.job.state,
+                    job.job.name
+                )
+                .as_bytes(),
+            )
+            .await?;
+        }
         out.flush().await?;
         Ok(())
     }
 
-    async fn move_job_to_foreground(&mut self, _id: Option<u32>) -> io::Result<()> {
+    async fn move_job_to_foreground(&mut self, id: Option<u32>) -> io::Result<()> {
+        let job = match id {
+            Some(id) => self.bg_jobs.remove_entry(&(id as usize)),
+            None => self.bg_jobs.pop_first(),
+        };
+
+        let Some((_, mut job)) = job else {
+            return Ok(());
+        };
+
+        if job.job.state == JobState::Stopped {
+            unsafe {
+                libc::kill(job.job.pid.unwrap() as i32, libc::SIGCONT);
+            }
+        }
+
+        set_stdin_non_blocking()?;
+        job.job.resume();
+        let BgJob { job, handle } = job;
+        self.block_or_stop(job, handle).await?;
+
         Ok(())
     }
 
@@ -363,6 +387,8 @@ impl Shell {
     }
 
     fn handle_exit(&mut self) {
+        self.cancellation_token.cancel();
+        disable_raw_mode().unwrap();
         exit(0);
     }
 }

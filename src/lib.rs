@@ -2,7 +2,7 @@
 
 use crate::utils::*;
 use autocomplete::Trie;
-use command::{Builtin, Command, CommandKind, ExternalCommand};
+use command::{Command, CommandKind, ExternalCommand};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use job::{BgJob, Job, JobHandle, JobId, JobState};
 use nix::pty::{openpty, OpenptyResult, Winsize};
@@ -13,11 +13,10 @@ use readline::Readline;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::ExitStatusExt;
 use std::process::{exit, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::io::{stderr, stdout, AsyncWrite};
+use tokio::io::{stderr, AsyncWrite};
 use tokio::select;
 use tokio::signal::unix::SignalKind;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
@@ -151,55 +150,11 @@ impl Shell {
     }
 
     pub async fn execute_builtin(&mut self, command: Command) -> io::Result<()> {
-        let mut out: &mut (dyn AsyncWrite + Unpin) = match command.stdout_redirect {
-            Some(ref out) => {
-                &mut open_file_async(out, command.sink.map(|s| s.is_append()).unwrap_or(false))
-                    .await?
-            }
-            None => &mut stdout(),
-        };
-        let err: &mut (dyn AsyncWrite + Unpin) = match command.stderr_redirect {
-            Some(ref err) => {
-                &mut open_file_async(err, command.sink.map(|s| s.is_append()).unwrap_or(false))
-                    .await?
-            }
-
-            None => &mut stderr(),
-        };
-
-        let CommandKind::Builtin(kind) = command.kind else {
+        let CommandKind::Builtin(ref kind) = command.kind else {
             return Ok(());
         };
-        match kind {
-            Builtin::Exit { status_code } => {
-                self.handle_exit(Some(ExitStatus::from_raw(status_code)))
-                    .await?
-            }
-            Builtin::Cd { path } => {
-                let home = std::env::var("HOME").unwrap();
-                let mut cd_path = path.clone();
-
-                if path == "~" {
-                    cd_path = home;
-                }
-
-                if std::env::set_current_dir(&cd_path).is_err() {
-                    err.write_all(format!("cd: {path}: No such file or directory\r\n").as_bytes())
-                        .await?;
-                }
-            }
-            Builtin::History => {
-                self.dump_history(&mut out).await?;
-            }
-            Builtin::Jobs => {
-                self.show_jobs(&mut out).await?;
-            }
-            Builtin::Fg(pid) => {
-                self.move_job_to_foreground(pid).await?;
-            }
-        }
-
-        Ok(())
+        // TODO: remove clone
+        kind.clone().execute(self, command).await
     }
 
     async fn execute_external_command(&mut self, command: ExternalCommand) -> io::Result<()> {

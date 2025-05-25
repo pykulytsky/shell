@@ -1,7 +1,11 @@
-use std::ffi::OsString;
+use std::os::unix::process::ExitStatusExt;
+use std::{ffi::OsString, process::ExitStatus};
+use tokio::io::{stderr, stdout, AsyncWriteExt};
 
+use crate::utils::open_file_async;
 use crate::{parse_prompt, readline::constants::REDIRECTS};
 use thiserror::Error;
+use tokio::io::AsyncWrite;
 
 #[derive(Debug, PartialEq, Clone, Copy, PartialOrd)]
 pub enum SinkKind {
@@ -31,6 +35,55 @@ pub enum Builtin {
     Fg(Option<u32>),
 }
 
+impl Builtin {
+    pub async fn execute(
+        self,
+        shell: &mut crate::Shell,
+        command: Command,
+    ) -> tokio::io::Result<()> {
+        let mut out: &mut (dyn AsyncWrite + Unpin) = match command.stdout_redirect {
+            Some(ref out) => {
+                &mut open_file_async(out, command.sink.map(|s| s.is_append()).unwrap_or(false))
+                    .await?
+            }
+            None => &mut stdout(),
+        };
+        let err: &mut (dyn AsyncWrite + Unpin) = match command.stderr_redirect {
+            Some(ref err) => {
+                &mut open_file_async(err, command.sink.map(|s| s.is_append()).unwrap_or(false))
+                    .await?
+            }
+
+            None => &mut stderr(),
+        };
+        match self {
+            Builtin::Exit { status_code } => {
+                shell
+                    .handle_exit(Some(ExitStatus::from_raw(status_code)))
+                    .await
+            }
+            Builtin::Cd { path } => {
+                let home = std::env::var("HOME").unwrap();
+                let mut cd_path = path.clone();
+
+                if path == "~" {
+                    cd_path = home;
+                }
+
+                if std::env::set_current_dir(&cd_path).is_err() {
+                    err.write_all(format!("cd: {path}: No such file or directory\r\n").as_bytes())
+                        .await?;
+                }
+
+                Ok(())
+            }
+            Builtin::History => shell.dump_history(&mut out).await,
+            Builtin::Jobs => shell.show_jobs(&mut out).await,
+            Builtin::Fg(pid) => shell.move_job_to_foreground(pid).await,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ExternalCommand {
     pub name: OsString,
@@ -57,7 +110,7 @@ impl TryFrom<Command> for ExternalCommand {
             })
         } else {
             Err(CommandError::InvalidCommand(
-                "not an externa commmand".to_owned(),
+                "not an external commmand".to_owned(),
             ))
         }
     }

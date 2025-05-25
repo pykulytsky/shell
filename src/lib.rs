@@ -105,12 +105,16 @@ impl Shell {
         enable_raw_mode()?;
         let _readline_task = self.spawn_readline_task().await;
 
-        while let Some((input, signal)) = self.readline_rx.recv().await {
-            self.handle_prompt(input, signal).await?;
+        loop {
+            select! {
+                Some((input, signal)) = self.readline_rx.recv() => {
+                    self.handle_prompt(input, signal).await?;
+                },
+                Some(job_id) = self.bg_job_finished.1.recv() => {
+                    self.bg_jobs.remove(&job_id);
+                }
+            }
         }
-
-        self.handle_exit();
-        Ok(())
     }
 
     pub async fn get_path_executable(&self, name: &str) -> Option<&DirEntry> {
@@ -246,13 +250,14 @@ impl Shell {
     async fn show_jobs<S: AsyncWrite + Unpin>(&self, out: &mut S) -> io::Result<()> {
         out.write_all(b"Job\tGroup\tState\tCommand\r\n").await?;
         for (id, job) in &self.bg_jobs {
+            let job = job.job.lock().await;
             out.write_all(
                 format!(
                     "{}\t{}\t{:?}\t{}\r\n",
                     id,
-                    job.job.pid.unwrap_or(0),
-                    job.job.state,
-                    job.job.name
+                    job.pid.unwrap_or(0),
+                    job.state,
+                    job.name
                 )
                 .as_bytes(),
             )
@@ -268,19 +273,23 @@ impl Shell {
             None => self.bg_jobs.pop_first(),
         };
 
-        let Some((_, mut job)) = job else {
+        let Some((_, job)) = job else {
             return Ok(());
         };
 
-        if job.job.state == JobState::Stopped {
+        let mut inner_job = job.job.lock().await;
+
+        if inner_job.state == JobState::Stopped {
             unsafe {
-                libc::kill(job.job.pid.unwrap() as i32, libc::SIGCONT);
+                libc::kill(inner_job.pid.unwrap() as i32, libc::SIGCONT);
             }
         }
 
         set_stdin_non_blocking()?;
-        job.job.resume();
-        let BgJob { job, handle, .. } = job;
+        inner_job.resume();
+        drop(inner_job);
+        let BgJob { handle, job, .. } = job;
+        let job = tokio::sync::Mutex::into_inner(Arc::into_inner(job).unwrap());
         self.block_or_stop(job, handle).await?;
 
         Ok(())

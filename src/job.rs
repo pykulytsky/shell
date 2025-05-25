@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
 use tokio::io::{self, AsyncReadExt};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use tokio::fs::File;
@@ -19,7 +20,7 @@ use crate::command::ExternalCommand;
 use crate::tty::drain_pty;
 use crate::utils::set_stdin_blocking;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum JobState {
     Started,
     Running,
@@ -74,7 +75,7 @@ impl<R> JobHandle<R> {
 pub struct Job {
     pub id: usize,
     pub name: String,
-    process: Child,
+    pub process: Child,
     pub pid: Option<u32>,
     // Cancellation token used to cancel stdin and stdout tasks.
     cancel_token: CancellationToken,
@@ -244,9 +245,9 @@ impl Job {
 
 #[derive(Debug)]
 pub struct BgJob {
-    pub(crate) job: Job,
+    pub(crate) job: Arc<Mutex<Job>>,
     pub(crate) handle: JobHandle,
-    pub(crate) finished: tokio::sync::mpsc::UnboundedSender<usize>,
+    pub finished: tokio::sync::mpsc::UnboundedSender<usize>,
 }
 
 impl BgJob {
@@ -255,6 +256,24 @@ impl BgJob {
         handle: JobHandle,
         finished: &tokio::sync::mpsc::UnboundedSender<usize>,
     ) -> Self {
+        let state = job.state;
+        let job = Arc::new(Mutex::new(job));
+        if state == JobState::Running {
+            let wait_job = job.clone();
+            let wait_finished = finished.clone();
+            tokio::spawn(async move {
+                loop {
+                    // TODO: send status code
+                    let exited = wait_job.lock().await.process.try_wait();
+                    if let Ok(Some(_)) = exited {
+                        wait_finished.send(wait_job.lock().await.id).unwrap();
+                        break;
+                    } else {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                }
+            });
+        }
         Self {
             job,
             handle,

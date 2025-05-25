@@ -29,6 +29,8 @@ pub enum JobState {
 
 static ID: LazyLock<AtomicUsize> = LazyLock::new(|| AtomicUsize::new(1));
 
+pub type JobId = usize;
+
 #[derive(Debug)]
 pub struct Master(File);
 
@@ -73,7 +75,7 @@ impl<R> JobHandle<R> {
 
 #[derive(Debug)]
 pub struct Job {
-    pub id: usize,
+    pub id: JobId,
     pub name: String,
     pub process: Child,
     pub pid: Option<u32>,
@@ -247,14 +249,14 @@ impl Job {
 pub struct BgJob {
     pub(crate) job: Arc<Mutex<Job>>,
     pub(crate) handle: JobHandle,
-    pub finished: tokio::sync::mpsc::UnboundedSender<usize>,
+    pub finished: tokio::sync::mpsc::UnboundedSender<(JobId, ExitStatus)>,
 }
 
 impl BgJob {
     pub fn new(
         job: Job,
         handle: JobHandle,
-        finished: &tokio::sync::mpsc::UnboundedSender<usize>,
+        finished: &tokio::sync::mpsc::UnboundedSender<(JobId, ExitStatus)>,
     ) -> Self {
         let state = job.state;
         let job = Arc::new(Mutex::new(job));
@@ -265,8 +267,10 @@ impl BgJob {
                 loop {
                     // TODO: send status code
                     let exited = wait_job.lock().await.process.try_wait();
-                    if let Ok(Some(_)) = exited {
-                        wait_finished.send(wait_job.lock().await.id).unwrap();
+                    if let Ok(Some(exit_status)) = exited {
+                        wait_finished
+                            .send((wait_job.lock().await.id, exit_status))
+                            .unwrap();
                         break;
                     } else {
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

@@ -4,7 +4,7 @@ use crate::utils::*;
 use autocomplete::Trie;
 use command::{Builtin, Command, CommandKind, ExternalCommand};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use job::{BgJob, Job, JobHandle, JobState};
+use job::{BgJob, Job, JobHandle, JobId, JobState};
 use nix::pty::{openpty, OpenptyResult, Winsize};
 use prompt::DirPrompt;
 use readline::constants::{BUILTINS, DOUBLE_QUOTES_ESCAPE};
@@ -13,6 +13,7 @@ use readline::Readline;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::ExitStatusExt;
 use std::process::{exit, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -46,17 +47,15 @@ pub struct Shell {
 
     fg_job_pid: Arc<Mutex<Option<u32>>>,
     bg_jobs: std::collections::BTreeMap<usize, BgJob>,
-    bg_job_finished: (
-        tokio::sync::mpsc::UnboundedSender<usize>,
-        tokio::sync::mpsc::UnboundedReceiver<usize>,
-    ),
+    bg_job_finished_sender: tokio::sync::mpsc::UnboundedSender<(JobId, ExitStatus)>,
+    bg_job_finished_receiver: tokio::sync::mpsc::UnboundedReceiver<(JobId, ExitStatus)>,
 
     is_interactive: Arc<AtomicBool>,
     notify_is_interactive: Arc<Notify>,
     sigtstp_received: Arc<Notify>,
 
-    readline_rx: UnboundedReceiver<(String, Signal)>, // maybe should use watch channel
-    readline_tx: UnboundedSender<(String, Signal)>,
+    readline_receiver: UnboundedReceiver<(String, Signal)>, // maybe should use watch channel
+    readline_sender: UnboundedSender<(String, Signal)>,
 
     cancellation_token: CancellationToken,
 }
@@ -75,27 +74,29 @@ impl Shell {
             }
         }
 
-        let (command_tx, command_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (readline_sender, readline_receiver) = tokio::sync::mpsc::unbounded_channel();
         let cancellation_token = CancellationToken::new();
         let notify_is_interactive = Arc::new(tokio::sync::Notify::new());
         let sigtstp_received = Arc::new(tokio::sync::Notify::new());
         let bg_jobs = std::collections::BTreeMap::new();
-        let bg_jobs_channel = tokio::sync::mpsc::unbounded_channel();
+        let (bg_job_finished_sender, bg_job_finished_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
 
         Ok(Self {
             path,
             path_executables,
             last_status: None,
             autocomplete_options,
-            readline_tx: command_tx,
-            readline_rx: command_rx,
+            readline_sender,
+            readline_receiver,
             cancellation_token,
             is_interactive: Arc::new(AtomicBool::new(true)),
             notify_is_interactive,
             sigtstp_received,
             fg_job_pid: Arc::new(Mutex::new(None)),
             bg_jobs,
-            bg_job_finished: bg_jobs_channel,
+            bg_job_finished_sender,
+            bg_job_finished_receiver,
         })
     }
 
@@ -107,11 +108,12 @@ impl Shell {
 
         loop {
             select! {
-                Some((input, signal)) = self.readline_rx.recv() => {
+                Some((input, signal)) = self.readline_receiver.recv() => {
                     self.handle_prompt(input, signal).await?;
                 },
-                Some(job_id) = self.bg_job_finished.1.recv() => {
+                Some((job_id, exit_status)) = self.bg_job_finished_receiver.recv() => {
                     self.bg_jobs.remove(&job_id);
+                    self.set_status(exit_status);
                 }
             }
         }
@@ -169,7 +171,10 @@ impl Shell {
             return Ok(());
         };
         match kind {
-            Builtin::Exit { status_code } => exit(status_code),
+            Builtin::Exit { status_code } => {
+                self.handle_exit(Some(ExitStatus::from_raw(status_code)))
+                    .await?
+            }
             Builtin::Cd { path } => {
                 let home = std::env::var("HOME").unwrap();
                 let mut cd_path = path.clone();
@@ -202,8 +207,10 @@ impl Shell {
         let (job, handle) = self.spawn_fg_job(command).await?;
         if is_in_bg {
             set_stdin_blocking()?;
-            self.bg_jobs
-                .insert(job.id, BgJob::new(job, handle, &self.bg_job_finished.0));
+            self.bg_jobs.insert(
+                job.id,
+                BgJob::new(job, handle, &self.bg_job_finished_sender),
+            );
         } else {
             self.block_or_stop(job, handle).await?;
         }
@@ -216,14 +223,14 @@ impl Shell {
             Ok(exit_status) = job.wait() => {
                 handle.stdin.await?;
                 handle.stdout.await?;
-                self.last_status = Some(exit_status);
+                self.set_status(exit_status);
             },
             _ = self.sigtstp_received.notified() => {
                 println!("\nReceived Ctrl+Z (SIGTSTP), suspending child...\r");
 
                 job.stop();
                 let id = job.id;
-                let bg_job = BgJob::new(job, handle, &self.bg_job_finished.0);
+                let bg_job = BgJob::new(job, handle, &self.bg_job_finished_sender);
                 self.bg_jobs.insert(id, bg_job);
 
                 set_stdin_blocking()?;
@@ -354,7 +361,7 @@ impl Shell {
         readline.autocomplete_options = self.autocomplete_options.clone();
         let readline_is_interactive = self.is_interactive.clone();
         let readline_cancel = self.cancellation_token.clone();
-        let readline_tx = self.readline_tx.clone();
+        let readline_tx = self.readline_sender.clone();
         let notified = self.notify_is_interactive.clone();
         tokio::spawn(async move {
             let mut input = String::new();
@@ -374,7 +381,7 @@ impl Shell {
 
     async fn handle_prompt(&mut self, input: String, signal: Signal) -> io::Result<()> {
         if signal == Signal::CtrlD {
-            self.handle_exit();
+            self.handle_exit(None).await?;
         }
         if !input.is_empty() {
             self.is_interactive.store(false, Ordering::SeqCst);
@@ -400,9 +407,25 @@ impl Shell {
         Ok(())
     }
 
-    fn handle_exit(&mut self) {
-        self.cancellation_token.cancel();
-        disable_raw_mode().unwrap();
-        exit(0);
+    async fn handle_exit(&mut self, status: Option<ExitStatus>) -> io::Result<()> {
+        if self.bg_jobs.is_empty() {
+            self.cancellation_token.cancel();
+            disable_raw_mode().unwrap();
+            exit(status.and_then(|s| s.code()).unwrap_or(0));
+        } else {
+            let mut stderr = stderr();
+            eprintln!("\r\nThere are still jobs active:\r");
+            self.show_jobs(&mut stderr).await?;
+            println!("\r");
+        }
+
+        Ok(())
+    }
+
+    fn set_status(&mut self, status: ExitStatus) {
+        // It is safe to unwrap status, as it is sent to the channel only after process is
+        // finished, therefore process never might be stopped by signal.
+        std::env::set_var("status", status.code().unwrap().to_string());
+        self.last_status = Some(status);
     }
 }

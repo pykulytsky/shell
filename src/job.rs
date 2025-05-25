@@ -1,5 +1,4 @@
 use nix::unistd::dup;
-use std::ffi::OsStr;
 use std::io::Read;
 use std::io::Write;
 use std::ops::{Deref, DerefMut};
@@ -16,6 +15,7 @@ use tokio::fs::File;
 use tokio::process::{Child, Command};
 use tokio_util::sync::CancellationToken;
 
+use crate::command::ExternalCommand;
 use crate::tty::drain_pty;
 use crate::utils::set_stdin_blocking;
 
@@ -84,19 +84,19 @@ pub struct Job {
     is_interactive: Arc<AtomicBool>,
     pub(crate) stopped: Arc<AtomicBool>,
     pub(crate) state: JobState,
+    is_in_bg: Arc<AtomicBool>,
 }
 
 impl Job {
     /// Constructs new pty (Pseudo-terminal) and spawns a child in this pty.
     pub async fn new(
-        name: impl AsRef<OsStr>,
-        args: Vec<String>,
+        command: ExternalCommand,
         slave: &OwnedFd,
         master: &File,
         is_interactive: &Arc<AtomicBool>,
     ) -> io::Result<Self> {
-        let name = name
-            .as_ref()
+        let name = command
+            .name
             .to_str()
             .expect("utf-8 validation happens on higher level")
             .to_string();
@@ -105,8 +105,8 @@ impl Job {
         let slave_stdout = std::fs::File::from(dup(slave)?);
         let slave_stderr = std::fs::File::from(dup(slave)?);
 
-        let child = Command::new(&name)
-            .args(args)
+        let child = Command::new(&command.name)
+            .args(command.args)
             .stdin(Stdio::from(slave_stdin))
             .stdout(Stdio::from(slave_stdout))
             .stderr(Stdio::from(slave_stderr))
@@ -130,6 +130,7 @@ impl Job {
             is_interactive: Arc::clone(is_interactive),
             stopped: Arc::new(AtomicBool::new(false)),
             state: JobState::Started,
+            is_in_bg: Arc::new(AtomicBool::new(command.is_bg_job)),
         })
     }
 
@@ -140,6 +141,7 @@ impl Job {
         let stdin_is_interactive = self.is_interactive.clone();
         let stdin_stopped = self.stopped.clone();
         let stdin_cancel_token = self.cancel_token.clone();
+        let is_in_bg = self.is_in_bg.clone();
         let master_writer = self.master_writer.try_clone().await?;
         let Master(writer) = master_writer;
         let mut master_writer = writer.try_into_std().unwrap();
@@ -156,6 +158,7 @@ impl Job {
             while !stdin_cancel_token.is_cancelled() {
                 if !stdin_is_interactive.load(Ordering::SeqCst)
                     && !stdin_stopped.load(Ordering::SeqCst)
+                    && !is_in_bg.load(Ordering::SeqCst)
                 {
                     match stdin.read(&mut buf) {
                         Ok(0) => break,
@@ -182,13 +185,15 @@ impl Job {
         let stdout_cancel_token = self.cancel_token.clone();
         let mut master_reader = self.master_reader.try_clone().await?;
 
+        let is_in_bg = self.is_in_bg.clone();
         let stdout_task = tokio::spawn(async move {
             let mut stdout = std::io::stdout();
             let mut buf = [0u8; 1024];
 
             loop {
-                if !stdout_is_interactive.load(Ordering::SeqCst)
-                    && !stdout_stopped.load(Ordering::SeqCst)
+                if (!stdout_is_interactive.load(Ordering::SeqCst)
+                    && !stdout_stopped.load(Ordering::SeqCst))
+                    || is_in_bg.load(Ordering::SeqCst)
                 {
                     tokio::select! {
                         _ = stdout_cancel_token.cancelled() => break,
@@ -241,10 +246,19 @@ impl Job {
 pub struct BgJob {
     pub(crate) job: Job,
     pub(crate) handle: JobHandle,
+    pub(crate) finished: tokio::sync::mpsc::UnboundedSender<usize>,
 }
 
 impl BgJob {
-    pub fn new(job: Job, handle: JobHandle) -> Self {
-        Self { job, handle }
+    pub fn new(
+        job: Job,
+        handle: JobHandle,
+        finished: &tokio::sync::mpsc::UnboundedSender<usize>,
+    ) -> Self {
+        Self {
+            job,
+            handle,
+            finished: finished.clone(),
+        }
     }
 }

@@ -32,6 +32,38 @@ pub enum Builtin {
 }
 
 #[derive(Debug, Clone)]
+pub struct ExternalCommand {
+    pub name: OsString,
+    pub args: Vec<String>,
+    pub stdout_redirect: Option<String>,
+    pub stderr_redirect: Option<String>,
+    pub sink: Option<SinkKind>,
+    pub pipe_to: Option<Box<Command>>,
+    pub is_bg_job: bool,
+}
+
+impl TryFrom<Command> for ExternalCommand {
+    type Error = CommandError;
+    fn try_from(command: Command) -> Result<Self, Self::Error> {
+        if let CommandKind::External { name, args } = command.kind {
+            Ok(Self {
+                name,
+                args,
+                stdout_redirect: command.stdout_redirect,
+                stderr_redirect: command.stderr_redirect,
+                sink: command.sink,
+                pipe_to: command.pipe_to,
+                is_bg_job: command.is_bg_job,
+            })
+        } else {
+            Err(CommandError::InvalidCommand(
+                "not an externa commmand".to_owned(),
+            ))
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum CommandKind {
     External { name: OsString, args: Vec<String> },
     Builtin(Builtin),

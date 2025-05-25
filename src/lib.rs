@@ -2,7 +2,7 @@
 
 use crate::utils::*;
 use autocomplete::Trie;
-use command::{Builtin, Command, CommandKind};
+use command::{Builtin, Command, CommandKind, ExternalCommand};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use job::{BgJob, Job, JobHandle, JobState};
 use nix::pty::{openpty, OpenptyResult, Winsize};
@@ -10,7 +10,6 @@ use prompt::DirPrompt;
 use readline::constants::{BUILTINS, DOUBLE_QUOTES_ESCAPE};
 use readline::signal::Signal;
 use readline::Readline;
-use std::ffi::OsString;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::unix::fs::PermissionsExt;
@@ -47,6 +46,10 @@ pub struct Shell {
 
     fg_job_pid: Arc<Mutex<Option<u32>>>,
     bg_jobs: std::collections::BTreeMap<usize, BgJob>,
+    bg_job_finished: (
+        tokio::sync::mpsc::UnboundedSender<usize>,
+        tokio::sync::mpsc::UnboundedReceiver<usize>,
+    ),
 
     is_interactive: Arc<AtomicBool>,
     notify_is_interactive: Arc<Notify>,
@@ -77,6 +80,7 @@ impl Shell {
         let notify_is_interactive = Arc::new(tokio::sync::Notify::new());
         let sigtstp_received = Arc::new(tokio::sync::Notify::new());
         let bg_jobs = std::collections::BTreeMap::new();
+        let bg_jobs_channel = tokio::sync::mpsc::unbounded_channel();
 
         Ok(Self {
             path,
@@ -91,6 +95,7 @@ impl Shell {
             sigtstp_received,
             fg_job_pid: Arc::new(Mutex::new(None)),
             bg_jobs,
+            bg_job_finished: bg_jobs_channel,
         })
     }
 
@@ -188,13 +193,16 @@ impl Shell {
         Ok(())
     }
 
-    async fn execute_external_command(
-        &mut self,
-        name: OsString,
-        args: Vec<String>,
-    ) -> io::Result<()> {
-        let (job, handle) = self.spawn_fg_job(name, args).await?;
-        self.block_or_stop(job, handle).await?;
+    async fn execute_external_command(&mut self, command: ExternalCommand) -> io::Result<()> {
+        let is_in_bg = command.is_bg_job;
+        let (job, handle) = self.spawn_fg_job(command).await?;
+        if is_in_bg {
+            set_stdin_blocking()?;
+            self.bg_jobs
+                .insert(job.id, BgJob::new(job, handle, &self.bg_job_finished.0));
+        } else {
+            self.block_or_stop(job, handle).await?;
+        }
 
         Ok(())
     }
@@ -211,7 +219,7 @@ impl Shell {
 
                 job.stop();
                 let id = job.id;
-                let bg_job = BgJob::new(job, handle);
+                let bg_job = BgJob::new(job, handle, &self.bg_job_finished.0);
                 self.bg_jobs.insert(id, bg_job);
 
                 set_stdin_blocking()?;
@@ -272,13 +280,13 @@ impl Shell {
 
         set_stdin_non_blocking()?;
         job.job.resume();
-        let BgJob { job, handle } = job;
+        let BgJob { job, handle, .. } = job;
         self.block_or_stop(job, handle).await?;
 
         Ok(())
     }
 
-    async fn spawn_job(&mut self, name: OsString, args: Vec<String>) -> io::Result<Job> {
+    async fn spawn_job(&mut self, command: ExternalCommand) -> io::Result<Job> {
         let size = crossterm::terminal::window_size()?;
         let pty = openpty(
             Some(&Winsize {
@@ -295,17 +303,13 @@ impl Shell {
         let OpenptyResult { master, slave } = pty;
         std::mem::forget(master);
         let master = tokio::fs::File::from_std(std_master);
-        let job = job::Job::new(name, args, &slave, &master, &self.is_interactive).await?;
+        let job = job::Job::new(command, &slave, &master, &self.is_interactive).await?;
 
         Ok(job)
     }
 
-    async fn spawn_fg_job(
-        &mut self,
-        name: OsString,
-        args: Vec<String>,
-    ) -> io::Result<(Job, JobHandle)> {
-        let mut job = self.spawn_job(name, args).await?;
+    async fn spawn_fg_job(&mut self, command: ExternalCommand) -> io::Result<(Job, JobHandle)> {
+        let mut job = self.spawn_job(command).await?;
         *self.fg_job_pid.lock().unwrap() = job.pid;
         let handle = job.spawn().await?;
 
@@ -367,8 +371,9 @@ impl Shell {
             self.is_interactive.store(false, Ordering::SeqCst);
             match Command::parse(input.trim_start()).await {
                 Ok(command) => match command.kind {
-                    CommandKind::External { name, args } => {
-                        self.execute_external_command(name, args).await?;
+                    CommandKind::External { .. } => {
+                        let external_command = ExternalCommand::try_from(command).unwrap();
+                        self.execute_external_command(external_command).await?;
                     }
                     _ => {
                         self.execute_builtin(command).await?;

@@ -344,14 +344,16 @@ impl Shell {
                 Ok(command) => match command.kind {
                     CommandKind::External { .. } => {
                         let external_command = ExternalCommand::try_from(command).unwrap();
-                        self.execute_external_command(external_command).await?;
+                        if let Err(error) = self.execute_external_command(external_command).await {
+                            eprintln!("{error}\r");
+                        }
                     }
                     _ => {
                         self.execute_builtin(command).await?;
                     }
                 },
-                Err(_) => {
-                    todo!("write error");
+                Err(error) => {
+                    eprintln!("{error}\r");
                 }
             };
 

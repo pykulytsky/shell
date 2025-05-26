@@ -4,15 +4,15 @@ use std::{iter::Peekable, str::Chars};
 
 use crate::readline::constants::{DOUBLE_QUOTES_ESCAPE, GLOB};
 
-#[derive(Debug)]
-pub(crate) struct Tokenizer<'a> {
-    it: Peekable<Chars<'a>>,
+#[derive(Debug, Clone)]
+pub struct Tokenizer<'a> {
+    pub it: Peekable<Chars<'a>>,
     in_single_quotes: bool,
     in_double_quotes: bool,
 }
 
 #[derive(Debug, PartialEq, PartialOrd)]
-pub(crate) enum Token {
+pub enum Token {
     Literal(String),
     Pipe,
     And,
@@ -88,11 +88,6 @@ impl Iterator for Tokenizer<'_> {
                 ' ' if !self.in_single_quotes && !self.in_double_quotes => {
                     if !current.is_empty() {
                         if current.chars().any(|c| GLOB.contains(&c)) {
-                            // let glob_list = glob::glob(current.as_str())
-                            //     .into_iter()
-                            //     .flatten()
-                            //     .flatten()
-                            //     .flat_map(|p| p.to_str().map(|s| s.to_string()));
                             return Some(Token::GlobPattern(current.clone()));
                         } else {
                             return Some(Token::Literal(current.clone()));
@@ -102,7 +97,14 @@ impl Iterator for Tokenizer<'_> {
                 _ => current.push(c),
             }
         }
-        None
+
+        if current.is_empty() {
+            None
+        } else if current.chars().any(|c| GLOB.contains(&c)) {
+            Some(Token::GlobPattern(current))
+        } else {
+            Some(Token::Literal(current))
+        }
     }
 }
 
@@ -112,7 +114,7 @@ mod tests {
 
     #[test]
     fn it_works() {
-        let input = "cat *.rs | grep use";
+        let input = "cat *.rs | grep use 1> /tmp/test";
 
         let tokenizer = Tokenizer::new(input);
         let tokens: Vec<Token> = tokenizer.collect();
@@ -124,7 +126,10 @@ mod tests {
                 GlobPattern("*.rs".to_string()),
                 Pipe,
                 Literal("grep".to_string()),
-                Literal("use".to_string())
+                Literal("use".to_string()),
+                NumberLiteral(1),
+                RightAngle,
+                Literal("/tmp/test".to_string())
             ]
         );
     }

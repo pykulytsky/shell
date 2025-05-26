@@ -33,7 +33,7 @@ pub mod command;
 pub mod job;
 pub mod prompt;
 pub mod readline;
-mod tokenizer;
+pub mod tokenizer;
 pub mod tty;
 mod utils;
 
